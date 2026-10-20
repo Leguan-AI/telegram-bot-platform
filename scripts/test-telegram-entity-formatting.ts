@@ -30,7 +30,7 @@ const originalFetch = global.fetch;
 // Mock global fetch to capture sendMessage payload and provider calls
 global.fetch = async (url: any, options: any) => {
   const urlStr = url.toString();
-  if (urlStr.includes('api.anthropic.com') || urlStr.includes('api.deepseek.com')) {
+  if (new URL(urlStr).hostname === 'api.anthropic.com' || new URL(urlStr).hostname === 'api.deepseek.com') {
     lastProviderUrl = urlStr;
     lastProviderBody = JSON.parse(options.body);
     const messagesBody = {
@@ -372,7 +372,7 @@ async function main() {
     });
 
     assert.ok(lastProviderUrl, 'Fetch must have been intercepted');
-    assert.ok(lastProviderUrl.includes('api.deepseek.com'), 'Must hit DeepSeek endpoint');
+    assert.ok(new URL(lastProviderUrl).hostname === 'api.deepseek.com', 'Must hit DeepSeek endpoint');
     assert.ok(lastProviderBody, 'Request body must be captured');
     assert.ok(lastProviderBody.metadata, 'metadata must be present');
     assert.strictEqual(lastProviderBody.metadata.user_id, expectedScopeId, 'metadata.user_id must match');
@@ -390,7 +390,7 @@ async function main() {
     });
 
     assert.ok(lastProviderUrl);
-    assert.ok(lastProviderUrl.includes('api.anthropic.com'));
+    assert.ok(new URL(lastProviderUrl).hostname === 'api.anthropic.com');
     assert.ok(lastProviderBody);
     assert.ok(lastProviderBody.metadata);
     assert.strictEqual(lastProviderBody.metadata.user_id, expectedScopeId);

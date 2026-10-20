@@ -28,7 +28,7 @@ let fetchMockUsage: any = {
 
 global.fetch = async (url: any, options: any) => {
   const urlStr = url.toString();
-  if (urlStr.includes('api.anthropic.com') || urlStr.includes('api.deepseek.com')) {
+  if (new URL(urlStr).hostname === 'api.anthropic.com' || new URL(urlStr).hostname === 'api.deepseek.com') {
     lastProviderUrl = urlStr;
     lastProviderBody = JSON.parse(options.body);
     const messagesBody = {

@@ -519,7 +519,7 @@ async function main() {
     assert.strictEqual(docs4[0].display_name, 'topic-slug-a');
     assert.strictEqual(docs4[0].content, 'Topic context in Group A (Refreshed and Updated)');
 
-    const anthropicCalls = fetchCalls.filter((c) => c.url.includes('api.anthropic.com'));
+    const anthropicCalls = fetchCalls.filter((c) => new URL(c.url).hostname === 'api.anthropic.com');
     assert.strictEqual(anthropicCalls.length, 0, 'No LLM name generation should run on update-in-place path');
 
     const edits4 = fetchCalls.filter((c) => c.url.includes('editMessageText'));
