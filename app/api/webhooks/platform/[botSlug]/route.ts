@@ -36,6 +36,7 @@ import {
 } from '@/lib/telegram';
 import { getModelIdentifier, ANTHROPIC_DOCUMENT_MODEL } from '@/lib/config';
 import { DocumentReadError } from '@/lib/model';
+import { isPushableTextFile, decodePushedFile, PushFileError, MAX_PUSH_FILE_BYTES } from '@/lib/pushFile';
 import {
   shouldAnnounceFirstAdd,
   buildJoinerMentions,
@@ -283,7 +284,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const rawCaption = message.caption?.trim() ?? null;
     const captionMentionsBot = !!(message.document && rawCaption && botUsername && rawCaption.includes('@' + botUsername));
 
-    if (!rawText && !captionMentionsBot) {
+    const captionIsPush = !!(message.document && rawCaption && rawCaption.startsWith('/push'));
+
+    if (!rawText && !captionMentionsBot && !captionIsPush) {
       return NextResponse.json({ ok: true });
     }
 
@@ -297,7 +300,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const isWhoamiCommand = rawText ? rawText.startsWith('/whoami') : false;
     const isAuthCommand = rawText ? rawText.startsWith('/auth') : false;
     const isRecapCommand = rawText ? rawText.startsWith('/recap') : false;
-    const isPushCommand = rawText ? rawText.startsWith('/push') : false;
+    const isPushCommand = rawText ? rawText.startsWith('/push') : captionIsPush;
     const isMention = botUsername ? effectiveText.includes(`@${botUsername}`) : false;
 
     let isCommand = false;
@@ -615,7 +618,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         (async () => {
           const helpText = `<b>Telegram Bot Platform Help</b>\n\n` +
             `• Use <code>/context</code> to see what documentation I'm answering from in this topic.\n` +
-            `• Use <code>/push topic</code> or <code>/push group</code> as a <i>reply</i> to a message to save that message as context for the topic or group (group admins only).\n` +
+            `• Use <code>/push topic</code> or <code>/push group</code> as a <i>reply</i> to a message, or as the caption of an attached .txt/.md file, to save it as context for the topic or group (group admins only).\n` +
             `• Use <code>/recap [N]</code> to summarize the last N messages here (default 20).\n` +
             `• Use <code>/whoami</code> to show this chat's ids (useful for setup/diagnostics).\n` +
             `• Mention me <code>@${botUsername} &lt;question&gt;</code> inside a topic to ask a question.`;
@@ -793,7 +796,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       if (normalized === 'topic' || normalized === 't') scope = 'topic';
       else if (normalized === 'group' || normalized === 'g') scope = 'group';
 
-      const usageMessage = 'Usage: reply to a message with <code>/push topic</code> or <code>/push group</code> to save it as lasting context. (Group admins only.)';
+      const usageMessage = 'Usage: reply to a message with <code>/push topic</code> or <code>/push group</code> to save it as lasting context. You can also attach a .txt or .md file with <code>/push group</code> as its caption (or reply to the file). (Group admins only.)';
 
       if (!scope) {
         try {
@@ -808,10 +811,12 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         return NextResponse.json({ ok: true, msg: 'Invalid push scope' });
       }
 
+      // The pushed source is, in order: the command message's own attached file (caption `/push ...`),
+      // the replied-to message's text, or the replied-to message's attached file.
       const replyTarget = message.reply_to_message;
-      if (!replyTarget) {
+      if (!replyTarget && !message.document) {
         try {
-          await sendMessage(bot.telegram_bot_token, message.chat.id, 'Reply to a message with <code>/push topic</code> or <code>/push group</code> to save its text as lasting context.', {
+          await sendMessage(bot.telegram_bot_token, message.chat.id, 'Reply to a message with <code>/push topic</code> or <code>/push group</code> to save its text as lasting context, or attach a .txt/.md file with the command as its caption.', {
             threadId,
             replyToMessageId: message.message_id,
             parseMode: 'HTML',
@@ -822,22 +827,13 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         return NextResponse.json({ ok: true, msg: 'Missing reply target' });
       }
 
-      const rawTargetText = replyTarget.text?.trim() ?? null;
-      if (replyTarget.document && !rawTargetText) {
-        try {
-          await sendMessage(bot.telegram_bot_token, message.chat.id, "I can't push a document directly. Mention me on it first to get a text summary, then reply to that summary with /push.", {
-            threadId,
-            replyToMessageId: message.message_id,
-          });
-        } catch (sendErr) {
-          console.error('Failed to send direct-doc prompt:', sendErr);
-        }
-        return NextResponse.json({ ok: true, msg: 'Direct document push rejected' });
-      }
+      const rawTargetText = message.document ? null : (replyTarget?.text?.trim() ?? null);
+      const pushDoc = rawTargetText ? null : (message.document ?? replyTarget?.document ?? null);
+      const pushOriginMessageId = message.document ? message.message_id : replyTarget!.message_id;
 
-      if (!rawTargetText) {
+      if (!rawTargetText && !pushDoc) {
         try {
-          await sendMessage(bot.telegram_bot_token, message.chat.id, 'I can only push text messages. Reply to a text message (or one of my text answers) with /push.', {
+          await sendMessage(bot.telegram_bot_token, message.chat.id, 'I can only push text messages or .txt/.md files. Reply to a text message (or one of my text answers) with /push.', {
             threadId,
             replyToMessageId: message.message_id,
           });
@@ -845,6 +841,26 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
           console.error('Failed to send text-only prompt:', sendErr);
         }
         return NextResponse.json({ ok: true, msg: 'Non-text push rejected' });
+      }
+
+      if (pushDoc) {
+        let fileProblem: string | null = null;
+        if (!isPushableTextFile(pushDoc)) {
+          fileProblem = "I can only push plain-text files (.txt or .md). For a PDF, mention me on it first to get a text summary, then reply to that summary with /push.";
+        } else if (pushDoc.file_size && pushDoc.file_size > MAX_PUSH_FILE_BYTES) {
+          fileProblem = `That file is too large to push (max ${MAX_PUSH_FILE_BYTES / 1024} KB).`;
+        }
+        if (fileProblem) {
+          try {
+            await sendMessage(bot.telegram_bot_token, message.chat.id, fileProblem, {
+              threadId,
+              replyToMessageId: message.message_id,
+            });
+          } catch (sendErr) {
+            console.error('Failed to send file-rejected prompt:', sendErr);
+          }
+          return NextResponse.json({ ok: true, msg: 'Push file rejected' });
+        }
       }
 
       let isAdmin = false;
@@ -887,14 +903,20 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
                   throw new Error('no_topic_here');
                 }
 
+                let content = rawTargetText;
+                if (!content) {
+                  const fileData = await downloadTelegramFile(bot.telegram_bot_token, pushDoc!.file_id, MAX_PUSH_FILE_BYTES);
+                  content = decodePushedFile(fileData.data);
+                }
+
                 const pushedResult = await pushContext({
                   entityId: entity.id,
                   groupId: group.id,
                   scope: scope!,
                   threadTelegramId: threadId,
-                  content: rawTargetText,
+                  content,
                   originChatId: message.chat.id.toString(),
-                  originMessageId: replyTarget.message_id.toString(),
+                  originMessageId: pushOriginMessageId.toString(),
                   pushedByTgUserId: callerId!,
                   pushedByUsername: message.from?.username ?? null,
                   botId,
@@ -904,7 +926,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
                 const scopeLabel = scope === 'topic' ? 'this topic' : 'this group';
                 const prefix = pushedResult.isUpdate ? '🔄 <b>Updated in ' : '✅ <b>Saved to ';
                 const escapedSnippet = sanitizeForTelegramHtml(
-                  rawTargetText.length > 100 ? rawTargetText.slice(0, 100) + '…' : rawTargetText
+                  content.length > 100 ? content.slice(0, 100) + '…' : content
                 );
 
                 const htmlString = `${prefix}${scopeLabel}</b>\n\n<b>${pushedResult.name}</b>\n${escapedSnippet}`;
@@ -913,6 +935,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
               mapError: (err: any) => {
                 if (err?.message === 'no_topic_here') {
                   return "There's no topic here to push to — try /push group instead, or push from inside a specific topic.";
+                }
+                if (err instanceof PushFileError) {
+                  return err.reason === 'empty'
+                    ? 'That file is empty — nothing to push.'
+                    : "I couldn't read that file as text. Please attach a UTF-8 .txt or .md file.";
+                }
+                if (typeof err?.message === 'string' && err.message.includes('maximum download cap')) {
+                  return `That file is too large to push (max ${MAX_PUSH_FILE_BYTES / 1024} KB).`;
                 }
                 return '⚠️ Sorry, something went wrong while processing your request.';
               },

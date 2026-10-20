@@ -354,7 +354,7 @@ Idempotent (drop-then-recreate), no backfill needed (existing rows are all `'man
 ## 11. Does NOT do
 
 - Entity-level pushes (dashboard-only, deliberately not a chat command — see §0).
-- Pushing raw documents/files — text only; a document reply is redirected to "summarize it first."
+- Pushing PDFs or other binary files — only plain-text `.txt`/`.md` attachments are accepted (see §14); a PDF is redirected to "summarize it first."
 - A user-supplied name/title argument — fully superseded by LLM-generated naming.
 - Renaming or deleting a previously-pushed doc from chat. Admins can't yet retitle or remove what
   they've pushed via any interface — that's future dashboard work (view/delete over pushed context),
@@ -427,3 +427,24 @@ Seed a test entity/group/thread fixture (mirroring `test-group-scoped-context.ts
   `manifest_entries.telegram_thread_id`) — confirm that migration has been applied via `npx supabase db
   push` before implementation, since the insert/update statements in §5/§7 will fail against the old
   shape (they don't supply `doc_path`, which was `NOT NULL` pre-drop).
+
+---
+
+## 14. Addendum — pushing a `.txt` / `.md` attachment
+
+`/push topic|group` also accepts a plain-text file, in two forms:
+
+- **Caption:** attach the file and use `/push group` (or `topic`) as its caption.
+- **Reply:** reply to an already-sent file with `/push group`.
+
+Behavior (helpers in `lib/pushFile.ts`, tests in `scripts/test-push-file.ts`):
+
+- Accepted by `.txt`/`.md`/`.markdown` extension **or** `text/plain`/`text/markdown` mime (clients often send
+  `.md` as `application/octet-stream`). Anything else gets a "plain-text files only" reply.
+- Size cap `MAX_PUSH_FILE_BYTES` = 256 KB, checked from Telegram's `file_size` synchronously and again at
+  download time. Pushed docs are loaded into every prompt for their scope, so the cap is deliberately small.
+- Content must be strict UTF-8 with no NUL bytes and non-empty after trim, else a friendly error.
+- Same admin gate, scope resolution, LLM naming and write path as a text push. The origin key is the file
+  message's own `(chat_id, message_id)` (caption form) or the replied-to file message's (reply form), so
+  re-sending/re-pushing the same file message updates in place; a newly sent file creates a new doc.
+- Text takes precedence: replying to a message that has `text` pushes that text, never a file.
