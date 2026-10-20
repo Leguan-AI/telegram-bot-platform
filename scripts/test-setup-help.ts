@@ -23,3 +23,9 @@ test('covers every setup step and escapes the /auth placeholder', () => {
 test('nudge points at /help', () => {
   assert.ok(UNLINKED_NUDGE.includes('/help'));
 });
+
+test('a quote in the app URL cannot break out of the href attribute', () => {
+  const html = getUnlinkedHelp('https://app.leguan.ai/"onclick="x');
+  assert.ok(html.includes('href="https://app.leguan.ai/&quot;onclick=&quot;x/manage"'), html);
+  assert.ok(/<a href="[^"]*">/.test(html), 'href must be a single well-formed attribute');
+});

@@ -3,10 +3,12 @@
 
 import { escapeHtml } from '@/lib/privacy';
 
+const escapeAttr = (s: string) => escapeHtml(s).replace(/"/g, '&quot;');
+
 function dashboardLink(appUrl: string): string {
   const base = appUrl.replace(/\/+$/, '');
   const label = base.replace(/^https?:\/\//, '');
-  return `<a href="${escapeHtml(base)}/manage">${escapeHtml(label)}/manage</a>`;
+  return `<a href="${escapeAttr(base)}/manage">${escapeHtml(label)}/manage</a>`;
 }
 
 /** `/help` reply for a group that is not linked to a workspace yet: the setup steps. */
