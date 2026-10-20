@@ -33,7 +33,7 @@ let sentMessages: any[] = [];
 const originalFetch = global.fetch;
 global.fetch = (async (url: any, options: any) => {
   const urlStr = url.toString();
-  if (urlStr.includes('api.telegram.org')) {
+  if (new URL(urlStr).hostname === 'api.telegram.org') {
     if (urlStr.includes('getChatMember')) {
       return new Response(JSON.stringify({ ok: true, result: { status: mockChatMemberStatus } }), { status: 200 });
     }
