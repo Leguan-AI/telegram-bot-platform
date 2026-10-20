@@ -46,7 +46,7 @@ export function buildJoinerMentions(users: any[]): { joiners: any[]; mentionsHtm
 export function getAnnounceFirstAdd(): string {
   const privacyUrl = getPrivacyPolicyUrl();
   return (
-    `👋 Hi everyone — I'm Leguan, an AI assistant that was just added to this group.\n\n` +
+    `👋 Hi everyone — I'm Leguan, an AI assistant that was just added to this group. Send /help for setup steps.\n\n` +
     `Once set up, I can answer questions from your team's saved documents (mention me), ` +
     `summarize recent discussion (<code>/recap</code>), and save messages as lasting context (<code>/push</code>).\n\n` +
     `To do that, I log group messages and may send them to AI model providers to generate answers. ` +
