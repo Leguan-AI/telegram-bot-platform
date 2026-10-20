@@ -36,6 +36,7 @@ import {
 } from '@/lib/telegram';
 import { getModelIdentifier, ANTHROPIC_DOCUMENT_MODEL } from '@/lib/config';
 import { DocumentReadError } from '@/lib/model';
+import { getUnlinkedHelp, UNLINKED_NUDGE } from '@/lib/setupHelp';
 import { isPushableTextFile, decodePushedFile, PushFileError, MAX_PUSH_FILE_BYTES } from '@/lib/pushFile';
 import {
   shouldAnnounceFirstAdd,
@@ -541,8 +542,23 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: true, msg: 'Auth command processed' });
     }
 
-    // 6. Bail if group is not bound
+    // 6. Group is not bound: /help explains setup; other commands/mentions get a nudge; everything else is ignored
     if (!entityId) {
+      const isGroupChat = message.chat.type === 'group' || message.chat.type === 'supergroup';
+      if (isGroupChat && (isCommand || isBotMention)) {
+        try {
+          await sendMessage(
+            bot.telegram_bot_token,
+            message.chat.id,
+            isHelpCommand
+              ? getUnlinkedHelp(process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000')
+              : UNLINKED_NUDGE,
+            { threadId, replyToMessageId: message.message_id, parseMode: 'HTML' }
+          );
+        } catch (err) {
+          console.error('Failed to send unlinked-group notice:', err);
+        }
+      }
       console.info(`Message received from untracked chat ID: ${message.chat.id}`);
       return NextResponse.json({ ok: true, msg: 'Untracked group' });
     }
