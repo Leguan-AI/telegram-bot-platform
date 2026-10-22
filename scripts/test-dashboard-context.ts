@@ -1,6 +1,10 @@
 // Verification suite for dashboard context management (list/get/save_managed_context).
 // Run with: npx tsx scripts/test-dashboard-context.ts
 //
+// WARNING: this harness inserts and deletes fixture rows in auth.users and public.entities (UUID-scoped).
+// Run it against a Supabase branch or staging database, NOT production: an interrupted run would leave
+// fake auth users and entities behind. In production, verify with the dashboard UI instead.
+//
 // Requires the migration 20261022000000_dashboard_context_management.sql to already be applied by the
 // operator (this script never applies migrations or touches the migration ledger). All rows are keyed to
 // fixture UUIDs below; cleanup never runs an unscoped delete.
