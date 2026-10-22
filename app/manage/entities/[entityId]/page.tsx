@@ -917,6 +917,15 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                         <li key={line} style={{ marginBottom: '0.35rem' }}>{line}</li>
                       ))}
                     </ul>
+                    {/* §8: the recommendation belongs here, where the choice is still
+                        ahead of whoever is about to make it. */}
+                    <div className="alert alert-warning" style={{ marginTop: '1.25rem' }}>
+                      <span>
+                        <strong>On the GitHub screen, choose &ldquo;Only select repositories&rdquo;.</strong>{' '}
+                        {ALL_REPOS_WARNING}
+                      </span>
+                    </div>
+
                     <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginTop: '1rem' }}>
                       <button
                         onClick={handleConnectGithub}
