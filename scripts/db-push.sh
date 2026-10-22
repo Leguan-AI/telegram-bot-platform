@@ -44,7 +44,16 @@ MSG
 fi
 
 echo "Pushing migrations to project ${PROJECT_REF}..."
-npx supabase db push --project-ref "${PROJECT_REF}"
+
+# `db push` asks for confirmation before applying. A person at a prompt should get that
+# question; a non-interactive run has nobody to answer it, and there the deliberate
+# ALLOW_NONINTERACTIVE_DB_PUSH=1 above already served as the confirmation, so --yes stands
+# in for it rather than letting the push hang or abort on EOF.
+if [ -t 0 ]; then
+  npx supabase db push --project-ref "${PROJECT_REF}"
+else
+  npx supabase db push --project-ref "${PROJECT_REF}" --yes
+fi
 
 echo
 echo "Ledger after the push:"
