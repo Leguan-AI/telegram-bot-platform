@@ -138,7 +138,35 @@ select cron.schedule(
 
 ## A5c. Later migrations (operator step)
 
-Every file in `supabase/migrations/` after the init schema is applied the same way, in filename order: **`npx supabase db push`**, run by **you**, the operator. Nothing in the app or in `scripts/` pushes migrations, and no verification step may: the remote migration ledger (`supabase_migrations.schema_migrations`) is written by hand only (see `AGENTS.md`, rules 7–8). A test harness may re-apply an idempotent migration's raw DDL for its own convenience, which does **not** record it — if that happened before you pushed, push afterwards (the `already exists, skipping` notices are the idempotency proof) and confirm with `npx supabase migration list`.
+Every file in `supabase/migrations/` after the init schema is applied the same way, in filename order: **`npm run db:push`** (a thin wrapper over `supabase db push`), run by **you**, the operator. Nothing in the app or in `scripts/` pushes migrations, and no verification step may: the remote migration ledger (`supabase_migrations.schema_migrations`) is written by hand only (see `AGENTS.md`, rules 7–8). A test harness may re-apply an idempotent migration's raw DDL for its own convenience, which does **not** record it — if that happened before you pushed, push afterwards (the `already exists, skipping` notices are the idempotency proof) and confirm with `npm run db:status`.
+
+> **Pushing from a git worktree.** The CLI keeps its project link in `supabase/.temp`,
+> which is untracked, so a fresh worktree is **unlinked** and a bare `supabase db push`
+> fails with *"Cannot find project ref"*. Do not link each worktree, and do not try to
+> check the branch out in the main clone — git refuses a branch already checked out in a
+> worktree. Instead use the wrappers, which pass `--project-ref` and so rely on your
+> global `supabase login` rather than on a link, a database password or `.env.local`:
+>
+> ```bash
+> npm run db:status   # what is pending, read-only
+> npm run db:push     # apply it (operator only)
+> ```
+>
+> `npm run db:push` **refuses to run without a terminal**, which is rule 8 made
+> mechanical: CI, a test harness or an agent cannot push migrations, only a person at a
+> prompt can. Point either command at another project (a Supabase branch, say) with
+> `SUPABASE_PROJECT_REF=<ref> npm run db:status`.
+>
+> The database **test harnesses** are a separate matter: they are plain Postgres clients
+> that read `ADMIN_DATABASE_URL` / `DATABASE_URL`, and `.env.local` is gitignored, so it
+> exists only in the main clone. Give a worktree its own view of it once:
+>
+> ```bash
+> ln -s ../../../.env.local .env.local
+> ```
+>
+> That path holds for worktrees under `.claude/worktrees/<name>/`; the symlink is ignored
+> by git and survives branch switches.
 
 Current migrations that need a push beyond the init schema include:
 

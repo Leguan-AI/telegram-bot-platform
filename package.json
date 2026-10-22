@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "check:scripts": "tsc --noEmit -p tsconfig.scripts.json"
+    "check:scripts": "tsc --noEmit -p tsconfig.scripts.json",
+    "db:status": "npx supabase migration list --project-ref ${SUPABASE_PROJECT_REF:-eomnjhbjrkfcpzzbcdho}",
+    "db:push": "bash scripts/db-push.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
