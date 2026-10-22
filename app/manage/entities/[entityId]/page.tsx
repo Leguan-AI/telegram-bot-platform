@@ -7,6 +7,7 @@ import Link from 'next/link';
 import { GITHUB_CONNECT_DISCLOSURES, ALL_REPOS_WARNING } from '@/lib/githubConnectUi';
 import '../../manage.css';
 import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
+import { RepoLinkSection, type RepoLinkRow, type RepoOption } from './RepoLinkEditor';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'Agent Platform';
 
@@ -107,6 +108,13 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
   const [githubBusy, setGithubBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [inviteCopied, setInviteCopied] = useState(false);
+
+  // Repository links (#21 §3). Repository names come from GitHub via the picker route;
+  // only numeric ids are ever stored.
+  const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
+  const [repoLinks, setRepoLinks] = useState<RepoLinkRow[]>([]);
+  const [repoLoadError, setRepoLoadError] = useState('');
+  const [repoLoading, setRepoLoading] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -211,6 +219,56 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
       setGithubInvites([]);
     } else {
       setGithubInvites(invData || []);
+    }
+
+    // Only an active connection can hold links, and only then is the picker reachable.
+    if (((connData || [])[0] || null)?.status === 'active') {
+      await loadRepoData();
+    } else {
+      setRepoOptions([]);
+      setRepoLinks([]);
+    }
+  };
+
+  /**
+   * The picker's two halves: the repositories the installation contains (live from
+   * GitHub, through a server route that holds the installation token) and the links
+   * already saved (straight from the database as `authenticated`).
+   */
+  const loadRepoData = async () => {
+    setRepoLoading(true);
+    setRepoLoadError('');
+    try {
+      const { data: linkData, error: linkErr } = await supabase.rpc('list_repo_links', {
+        p_entity: entityId,
+      });
+      if (linkErr) throw linkErr;
+      setRepoLinks((linkData || []) as RepoLinkRow[]);
+
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        setRepoLoadError('Your session expired. Reload the page and sign in again.');
+        return;
+      }
+
+      const res = await fetch(`/api/github/repositories?entity=${encodeURIComponent(entityId)}`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setRepoOptions([]);
+        setRepoLoadError(
+          payload?.error === 'app_not_configured'
+            ? 'The GitHub App is not configured on the server yet, so the repository list is unavailable.'
+            : 'Could not read the shared repositories from GitHub. Reload to try again.'
+        );
+        return;
+      }
+      setRepoOptions((payload.repositories || []) as RepoOption[]);
+    } catch (err: any) {
+      setRepoLoadError(err.message || 'Could not load repository links.');
+    } finally {
+      setRepoLoading(false);
     }
   };
 
@@ -998,6 +1056,97 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                   </>
                 )}
               </div>
+
+              {githubConnection?.status === 'active' && (
+                <div className="card">
+                  <h2>Linked Repositories</h2>
+                  <p style={{ margin: 0, fontSize: '0.95rem', color: 'var(--text-muted)' }}>
+                    Choose which of the shared repositories the bot may read, and where.
+                    Linking a repository to a group lets <strong>every member of that group</strong>
+                    {' '}reach its code through the bot.
+                  </p>
+
+                  {repoLoadError && (
+                    <div className="alert alert-error" style={{ marginTop: '1rem' }}>{repoLoadError}</div>
+                  )}
+
+                  {repoLoading && !repoLoadError && (
+                    <p style={{ fontSize: '0.9rem', marginTop: '1rem' }}>Reading the shared repositories…</p>
+                  )}
+
+                  <RepoLinkSection
+                    key={`entity-${repoLinks.filter((l) => !l.group_id).map((l) => l.repo_id).join('-')}`}
+                    entityId={entityId}
+                    repositories={repoOptions}
+                    links={repoLinks.filter((l) => !l.group_id && !l.thread_id)}
+                    groupId={null}
+                    heading="Every group in this directory"
+                    description="For shared library repositories. Reachable from every group and topic here."
+                    onSaved={loadRepoData}
+                  />
+
+                  {linkedGroups.length === 0 ? (
+                    <p style={{ fontSize: '0.9rem', marginTop: '1.5rem' }}>
+                      No Telegram groups are linked yet — bind one under <strong>Linked Groups</strong> to
+                      give it repositories of its own.
+                    </p>
+                  ) : (
+                    linkedGroups.map((g) => (
+                      <RepoLinkSection
+                        key={`group-${g.id}-${repoLinks
+                          .filter((l) => l.group_id === g.id && !l.thread_id)
+                          .map((l) => l.repo_id)
+                          .join('-')}`}
+                        entityId={entityId}
+                        repositories={repoOptions}
+                        links={repoLinks.filter((l) => l.group_id === g.id && !l.thread_id)}
+                        groupId={g.id}
+                        heading={g.display_name || `Group ${g.telegram_chat_id}`}
+                        description="Reachable from every topic in this group, unless a topic is pinned to fewer."
+                        onSaved={loadRepoData}
+                      />
+                    ))
+                  )}
+
+                  {repoLinks.some((l) => l.thread_id) && (
+                    <div style={{ marginTop: '2rem' }}>
+                      <h3 style={{ fontSize: '1rem', marginBottom: '0.35rem' }}>Topic pins</h3>
+                      <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                        Topics pinned to a subset of their group's repositories. Pins can only narrow,
+                        never add. Setting them from here, and with <code>/repos</code> in chat, comes next.
+                      </p>
+                      <div className="table-container" style={{ marginTop: '1rem' }}>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Group</th>
+                              <th>Topic</th>
+                              <th>Repository id</th>
+                              <th>Pinned</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {repoLinks
+                              .filter((l) => l.thread_id)
+                              .map((l) => (
+                                <tr key={l.id}>
+                                  <td>{l.group_name || '—'}</td>
+                                  <td>{l.thread_name || `#${l.telegram_thread_id ?? '?'}`}</td>
+                                  <td>
+                                    <code>
+                                      {repoOptions.find((r) => r.id === l.repo_id)?.fullName ?? l.repo_id}
+                                    </code>
+                                  </td>
+                                  <td>{new Date(l.created_at).toLocaleString()}</td>
+                                </tr>
+                              ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {inviteLink && (
                 <div className="card">

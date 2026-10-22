@@ -148,6 +148,7 @@ Current migrations that need a push beyond the init schema include:
 | … | the Phase 1–3 management-plane, group-linking, thread-registry and logging migrations |
 | `20261022000000_dashboard_context_management.sql` | the dashboard context-document functions (`list_context_docs` / `get_managed_context` / `save_managed_context`) — see the dashboard content section below |
 | **`20261022010000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
+| **`20261022020000_repo_link_management.sql`** | **repository linking: `list_repo_links` for the dashboard, `set_repo_links` and `get_github_connection_for_admin` for the server routes, and two more scope invariants on the `repo_links` trigger (no group from another entity, no thread from another group). Required before the picker in the GitHub tab can save.** |
 
 > After pushing the GitHub App migration, verify the new tables carry both flags:
 > ```sql
@@ -253,11 +254,11 @@ values (
    | `DEEPSEEK_API_KEY` | your DeepSeek key | **Yes** | **Optional** — required only when using a DeepSeek model (e.g. `deepseek-v4-flash`). |
    | `MODEL_IDENTIFIER` | a current model id, e.g. `claude-sonnet-4-6` or `deepseek-v4-flash` | No | Platform-wide default model (the code checks `MODEL_IDENTIFIER` / `ANTHROPIC_MODEL`). |
    | `GITHUB_WEBHOOK_SECRET` | a strong shared secret | **Yes** | **Only needed if the optional GitHub sync-source is enabled** (not used in v1). Global HMAC secret; generate via password manager. |
-   | `GITHUB_APP_ID` | the GitHub App's App ID | **Yes** | GitHub App (A8e). Signs the App JWT that mints installation tokens. **Not read yet** — the connect flow needs no JWT; set it at registration time anyway. |
+   | `GITHUB_APP_ID` | the GitHub App's App ID | **Yes** | GitHub App (A8e). Signs the App JWT that mints installation tokens — read by the repository picker and the link save. |
    | `GITHUB_APP_SLUG` | the App slug (`github.com/apps/<slug>`) | **Yes** | GitHub App (A8e). Builds the install URL the GitHub owner is sent to. |
    | `GITHUB_APP_CLIENT_ID` | the App's Client ID | **Yes** | GitHub App (A8e). Used for the one-shot user-token exchange and its revocation. |
    | `GITHUB_APP_CLIENT_SECRET` | the App's client secret | **Yes** | GitHub App (A8e). Generated once, shown once. |
-   | `GITHUB_APP_PRIVATE_KEY` | PEM contents of the App private key | **Yes** | GitHub App (A8e). Literal `\n` escapes or a real multi-line value both work. **Not read yet** (arrives with the repo picker and answer-time tools); downloadable only at generation, so store it now. |
+   | `GITHUB_APP_PRIVATE_KEY` | PEM contents of the App private key | **Yes** | GitHub App (A8e). Literal `\n` escapes or a real multi-line value both work; read by the repository picker and the link save. Downloadable only at generation, so store it then. |
    | `GITHUB_APP_WEBHOOK_SECRET` | the App's webhook secret | **Yes** | GitHub App (A8e). HMAC over the raw body on `/api/webhooks/github`. **Not read yet** (arrives with the webhook route). Distinct from `GITHUB_WEBHOOK_SECRET` above — do not reuse that one. |
    | `NEXT_PUBLIC_SUPABASE_URL` | your Supabase project URL | No | Public by design; required for client-side Auth & DB queries. |
    | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | your Supabase publishable key (`sb_publishable_...`) | No | Public by design (browser-exposed, RLS-enforced); required for client-side Auth & DB. |
@@ -291,7 +292,7 @@ values (
 
    > `[VERIFY]` The current code reads `DATABASE_URL`, `ANTHROPIC_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the client-exposed variables `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_APP_NAME`, and `NEXT_PUBLIC_APP_URL` for brand management and OTP redirects. It also reads `DEEPSEEK_API_KEY` (only on a DeepSeek model), `MODEL_IDENTIFIER`, `MODEL_MAX_OUTPUT_TOKENS`, `CONTEXT_MESSAGE_HISTORY_LIMIT`, `APP_HMAC_PEPPER` and `PRIVACY_POLICY_URL`.
    >
-   > Of the GitHub App variables (A8e), the code reads **`GITHUB_APP_SLUG`, `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET`** today — that is the whole connect flow (`lib/githubApp.ts`, `/api/github/install`, `/api/github/callback`). **`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_APP_WEBHOOK_SECRET` are not read by any code path yet**; they arrive with the installation-token work (repo picker, answer-time tools) and the webhook route. Set them regardless — the private key can only be downloaded at the moment it is generated. Confirm no other env vars are expected.
+   > Of the GitHub App variables (A8e), the code reads **five** today: `GITHUB_APP_SLUG`, `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET` for the connect flow (`lib/githubApp.ts`, `/api/github/install`, `/api/github/callback`), plus `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for the installation tokens the repository picker and the link save mint (`lib/githubAppToken.ts`, `/api/github/repositories`, `/api/github/repo-links`). **`GITHUB_APP_WEBHOOK_SECRET` is still unread**; it starts mattering with the webhook route. Set it regardless — the private key can only be downloaded at the moment it is generated. Confirm no other env vars are expected.
 
 3. Deploy. Note the production URL Vercel assigns.
 
@@ -539,8 +540,15 @@ Redeploy so the new values are picked up.
 3. Press **Invite someone to connect GitHub** and open the link yourself in a private window: the
    landing page should name the directory and show the disclosures. Completing it from an account
    you own leaves the connection **pending confirmation** until an admin presses **Confirm**.
-4. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
-   (GitHub's own error text is never shown to the user).
+4. With the connection **active**, the GitHub tab shows **Linked Repositories**: the repositories
+   the owner shared, read live from GitHub, with a checkbox list for the whole directory and one
+   per linked Telegram group. Tick one and press **Save repositories**; the list of links is what
+   decides what the bot can read, and only numeric repository ids are stored, so a rename on
+   GitHub cannot break or redirect a link.
+5. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
+   (GitHub's own error text is never shown to the user). If the repository list does not load,
+   check `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` — the picker needs an installation token,
+   which the connect flow did not.
 
 > Nothing in this section is per-tenant. A second directory connecting a different GitHub account
 > needs no operator involvement.
