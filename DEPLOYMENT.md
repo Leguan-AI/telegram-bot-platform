@@ -701,6 +701,8 @@ select vault.update_secret(
 
 **Admin script env var:** `ADMIN_DATABASE_URL` (privileged `postgres` role, **pooler** host) — used only by `scripts/sync-commands.ts`, run locally. Must be `export`ed. Never deployed.
 
+**Probe script env vars (local only, never deployed):** `PROBE_TARGETS`, `DEEPSEEK_PROBE_MODELS`, `ANTHROPIC_PROBE_MODELS`, `PROBE_DUMP`, `PROBE_REQUIRE_ALL` — all optional, read only by `scripts/probe-custom-tool-support.ts`. The probe itself reads `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`. See "Verifying provider tool support (pre-flight gate)".
+
 **Per-bot secrets (in Vault):** the platform bot's telegram bot token + telegram webhook secret, referenced by `bots.token_secret_ref` / `bots.webhook_secret_ref` (UUID-as-text). (A per-entity GitHub token on `entities.github_token_id` exists only if the optional GitHub sync-source is enabled.)
 
 **Content (v1):** lives directly in `doc_cache`, pushed via SQL (B2) — *interim*, moving to a `/manage` content tab. No GitHub in the v1 path; the store is abstracted so sync-sources (GitHub/Drive/Notion/etc.) can populate the cache later — see `docs/VISION.md`.
@@ -745,16 +747,72 @@ select vault.update_secret(
 ### Switching the Active Model/Provider (Configuration Action)
 Swapping the model identifier or default provider is handled entirely via environment variable changes:
 1. Update `MODEL_IDENTIFIER` (or `ANTHROPIC_MODEL`) in Vercel to the desired model ID:
-   - For Anthropic: e.g. `claude-3-5-sonnet-20241022`, `claude-3-5-haiku-20241022`.
-   - For DeepSeek: e.g. `deepseek-v4-flash`, `deepseek-v4-pro`.
+   - For Anthropic: e.g. `claude-sonnet-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`.
+   - For DeepSeek: `deepseek-flash` or `deepseek-v4-pro`.
+
+   > [!WARNING]
+   > **Model ids go stale and a wrong one fails at answer time, not at deploy time.** A
+   > retired id returns 404 "model not found", which surfaces to users as the bot's generic
+   > "something went wrong" reply — exactly the `claude-3-5-sonnet-20241022` incident in
+   > "Resolved during first deploy" above. Confirm the id is still served before deploying:
+   > ```bash
+   > curl -s https://api.anthropic.com/v1/models \
+   >   -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01"
+   > curl -s https://api.deepseek.com/models -H "Authorization: Bearer $DEEPSEEK_API_KEY"
+   > ```
+   > The ids above were served on **2026-10-22**. Two DeepSeek notes from that check:
+   > `deepseek-flash` (DeepSeek-V4.1-Flash) is the current flash id, and the older
+   > `deepseek-v4-flash` used by earlier revisions of this guide still resolves as an alias
+   > — prefer the listed id for new configuration.
 2. If swapping to a `deepseek-*` model, verify `DEEPSEEK_API_KEY` is set in Vercel.
-3. Redeploy the application. The dynamic provider resolver (`resolveProvider`) routes matching model requests based on prefix.
+3. If the new model will serve answers that use tools (web search today, repository access per
+   issue #21), run the pre-flight probe below against it first.
+4. Redeploy the application. The dynamic provider resolver (`resolveProvider`) routes matching model requests based on prefix.
+
+### Verifying provider tool support (pre-flight gate)
+
+`scripts/probe-custom-tool-support.ts` verifies, against the **live** endpoint, that a provider
+supports the tool loop the bot's tool-using features depend on. It is a **verification step, not a
+deployment step**: it is run locally, by hand, before adopting a provider or model for a
+tool-using feature. It touches no database and needs no DB env.
+
+It proves five things per model, each a blocking gate: a custom tool is accepted and a `tool_use`
+block comes back with schema-valid input; the `tool_use` → `tool_result` round trip reaches the
+final answer; a multi-hop loop works (`list_tree` → `read_file` → answer); the `web_search` server
+tool and custom tools are accepted in one `tools` array; and both kinds actually drive a single
+answer. Two further probes report informationally on `tool_choice` and on an `is_error`
+`tool_result`.
+
+```bash
+node --env-file=.env.local node_modules/tsx/dist/cli.mjs scripts/probe-custom-tool-support.ts
+```
+
+Each target sends the request shape its own provider sends — `lib/providers/deepseek.ts` (thinking
+disabled, no `cache_control`) and `lib/providers/anthropic.ts` with `cacheable: true`
+(`cache_control: ephemeral` plus the prompt-caching beta header) — so a pass transfers to
+production. `PROBE_TARGETS`, `DEEPSEEK_PROBE_MODELS`, `ANTHROPIC_PROBE_MODELS`, `PROBE_DUMP` and
+`PROBE_REQUIRE_ALL` are documented in `.env.example`; **none of them belong in Vercel.**
+
+Read the exit code, not just the output: **0** passed, **1** a blocking probe failed, **2** no
+target was reached so nothing is proven, **3** `PROBE_REQUIRE_ALL=1` with a target left unproven.
+A target whose key is missing or rejected is reported as `NOT PROVEN`, never as a pass.
+
+**Cost:** the mixed-tools probes run real searches. DeepSeek charges no per-search surcharge;
+Anthropic's `web_search` is $10/1k searches, so the `anthropic` target costs a few cents per run.
+
+**Last run — 2026-10-22, all five gates passed** on `deepseek-flash`, `deepseek-v4-pro` and
+`claude-sonnet-5`. Full results, and the provider differences that implementations must handle
+(verbatim echo of assistant content blocks, answering every parallel `tool_use`, no reply-text
+extraction mid-loop, `pause_turn`, a hop cap), are recorded on issue #21 and in its spec §7.
 
 ### Adding a New Provider (Code Action)
 Adding a brand-new provider requires extending code, not just changing configuration:
 1. Create a new provider file under `lib/providers/` implementing the `ModelProvider` interface.
 2. Register the routing logic (e.g. prefix match) inside `resolveProvider` in `lib/model.ts`.
 3. Add the credential key to `.env.example`, the validator in `lib/config.ts` (if applicable), and document it in `DEPLOYMENT.md`.
+4. Add the provider as a target in `scripts/probe-custom-tool-support.ts` (mirroring the request
+   shape the new provider sends) and run the pre-flight gate above. A provider that fails it can
+   still serve plain answers, but must not be given tool-using features.
 
 ### Data Governance Policy
 > [!IMPORTANT]
