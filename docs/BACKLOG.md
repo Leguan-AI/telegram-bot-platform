@@ -182,7 +182,7 @@ protected as provider auth grows beyond our own static keys.
 
 ### P3 — Clean content-ingestion boundary (forward-compat seam — do when content-management is built)
 Not a feature on its own, but a **constraint** on the content-management work (the `/manage`
-Documents/Context tab that will replace DEPLOYMENT B2's manual SQL): whatever writes to `doc_cache`
+Documents/Context tab that replaces DEPLOYMENT B2's manual SQL — first version shipped as the `save_managed_context` function boundary): whatever writes to `doc_cache`
 should go through a well-defined function/API boundary, **not** ad-hoc SQL scattered across call
 sites. That boundary is the single door that (a) the web UI writes through, (b) a Notion/Git
 sync-source (`P1`) writes through, and (c) a future third-party connector would target. *Why it
