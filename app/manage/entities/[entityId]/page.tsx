@@ -4,6 +4,7 @@ import { Fragment, useEffect, useState, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
+import { GITHUB_CONNECT_DISCLOSURES, ALL_REPOS_WARNING } from '@/lib/githubConnectUi';
 import '../../manage.css';
 import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
 
@@ -14,6 +15,42 @@ interface Entity {
   slug: string;
   display_name: string;
   owner_profile_id: string;
+}
+
+interface GithubConnection {
+  id: string;
+  installation_id: number;
+  account_id: number;
+  account_login: string;
+  account_type: 'User' | 'Organization';
+  repository_selection: 'all' | 'selected';
+  status: 'pending_confirmation' | 'active' | 'suspended';
+  connected_by_github_login: string | null;
+  connected_by_profile_id: string | null;
+  invited_by_profile_id: string | null;
+  confirmed_by_profile_id: string | null;
+  confirmed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface GithubInvite {
+  id: string;
+  issued_by: string;
+  created_at: string;
+  expires_at: string;
+  consumed_at: string | null;
+  revoked_at: string | null;
+  completed_by_github_login: string | null;
+  installation_id: number | null;
+}
+
+/** Revoked / used / expired / pending — derived, so the list needs no server-side state. */
+function inviteState(inv: GithubInvite): 'revoked' | 'used' | 'expired' | 'pending' {
+  if (inv.revoked_at) return 'revoked';
+  if (inv.consumed_at) return 'used';
+  if (new Date(inv.expires_at).getTime() <= Date.now()) return 'expired';
+  return 'pending';
 }
 
 interface Authorization {
@@ -33,7 +70,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
   const [entity, setEntity] = useState<Entity | null>(null);
   const [authorizations, setAuthorizations] = useState<Authorization[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'settings' | 'team' | 'groups'>('settings');
+  const [activeTab, setActiveTab] = useState<'settings' | 'team' | 'groups' | 'github'>('settings');
 
   // Form states
   const [displayName, setDisplayName] = useState('');
@@ -61,6 +98,15 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
   const [contextDocs, setContextDocs] = useState<ContextDoc[]>([]);
   const [contextLoaded, setContextLoaded] = useState(false);
   const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null);
+
+  // GitHub connect states (#21 §2)
+  const [githubConnection, setGithubConnection] = useState<GithubConnection | null>(null);
+  const [githubInvites, setGithubInvites] = useState<GithubInvite[]>([]);
+  const [githubError, setGithubError] = useState('');
+  const [githubSuccess, setGithubSuccess] = useState('');
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
+  const [inviteCopied, setInviteCopied] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -131,11 +177,163 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
         } else {
           console.warn('Failed to load linked groups:', groupsErr);
         }
+
+        await loadGithubData();
       }
     } catch (err: any) {
       setEntityError(err.message || 'Failed to load entity.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // GitHub connect (#21 §2). Every write goes through a SECURITY DEFINER function that
+  // re-checks entity admin rights on the server; the browser is never trusted.
+  // ---------------------------------------------------------------------------
+
+  const loadGithubData = async () => {
+    const { data: connData, error: connErr } = await supabase.rpc('get_github_connection', {
+      p_entity: entityId,
+    });
+    if (connErr) {
+      console.warn('Failed to load GitHub connection:', connErr);
+      setGithubConnection(null);
+    } else {
+      setGithubConnection((connData || [])[0] || null);
+    }
+
+    const { data: invData, error: invErr } = await supabase.rpc('list_github_connect_invites', {
+      p_entity: entityId,
+    });
+    if (invErr) {
+      console.warn('Failed to load GitHub connect invites:', invErr);
+      setGithubInvites([]);
+    } else {
+      setGithubInvites(invData || []);
+    }
+  };
+
+  // §2a: mint a single-use state bound to this entity and this /manage user, then hand
+  // off to GitHub. The admin authorizes as the GitHub owner themselves, so the
+  // connection is active as soon as the callback verifies them.
+  const handleConnectGithub = async () => {
+    setGithubBusy(true);
+    setGithubError('');
+    setGithubSuccess('');
+    try {
+      const { data, error } = await supabase.rpc('mint_github_connect_token', {
+        p_entity: entityId,
+        p_kind: 'direct',
+      });
+      if (error) throw error;
+      window.location.href = `/api/github/install?state=${encodeURIComponent(data)}`;
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to start the GitHub connection.');
+      setGithubBusy(false);
+    }
+  };
+
+  // §2b: the invitee is the GitHub owner and needs no account here. The link is shown
+  // once, expires in 24 hours, and can be revoked below.
+  const handleCreateInvite = async () => {
+    setGithubBusy(true);
+    setGithubError('');
+    setGithubSuccess('');
+    setInviteLink(null);
+    try {
+      const { data, error } = await supabase.rpc('mint_github_connect_token', {
+        p_entity: entityId,
+        p_kind: 'invite',
+      });
+      if (error) throw error;
+      setInviteLink(`${window.location.origin}/github/connect?invite=${encodeURIComponent(data)}`);
+      setInviteCopied(false);
+      await loadGithubData();
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to create the invite.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleCopyInvite = async () => {
+    if (!inviteLink) return;
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setInviteCopied(true);
+      setTimeout(() => setInviteCopied(false), 1500);
+    } catch (err) {
+      // Graceful fallback: the link stays on screen to copy by hand
+    }
+  };
+
+  const handleRevokeInvite = async (inviteId: string) => {
+    setGithubError('');
+    setGithubSuccess('');
+    try {
+      const { error } = await supabase.rpc('revoke_github_connect_invite', {
+        p_entity: entityId,
+        p_invite: inviteId,
+      });
+      if (error) throw error;
+      setGithubSuccess('Invite revoked.');
+      setInviteLink(null);
+      await loadGithubData();
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to revoke the invite.');
+    }
+  };
+
+  // §2b step 6: until an admin confirms, the connection holds the entity's slot and
+  // nothing else — no repo can be linked and no repo tool runs.
+  const handleConfirmConnection = async () => {
+    setGithubBusy(true);
+    setGithubError('');
+    setGithubSuccess('');
+    try {
+      const { error } = await supabase.rpc('confirm_github_connection', { p_entity: entityId });
+      if (error) throw error;
+      setGithubSuccess('Connection confirmed.');
+      await loadGithubData();
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to confirm the connection.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleRejectConnection = async () => {
+    if (!confirm('Reject this connection? The GitHub account will not be connected to this directory.')) return;
+    setGithubBusy(true);
+    setGithubError('');
+    setGithubSuccess('');
+    try {
+      const { error } = await supabase.rpc('reject_github_connection', { p_entity: entityId });
+      if (error) throw error;
+      setGithubSuccess('Connection rejected. The slot is free again.');
+      await loadGithubData();
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to reject the connection.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleDisconnectGithub = async () => {
+    if (!confirm('Disconnect GitHub? Linked repositories are removed from every group in this directory.')) return;
+    setGithubBusy(true);
+    setGithubError('');
+    setGithubSuccess('');
+    try {
+      const { error } = await supabase.rpc('disconnect_github_connection', { p_entity: entityId });
+      if (error) throw error;
+      setGithubSuccess('GitHub disconnected. Remove the installation on GitHub too if you no longer want it there.');
+      await loadGithubData();
+    } catch (err: any) {
+      setGithubError(err.message || 'Failed to disconnect GitHub.');
+    } finally {
+      setGithubBusy(false);
     }
   };
 
@@ -328,6 +526,14 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                 className={`tab-btn ${activeTab === 'groups' ? 'active' : ''}`}
               >
                 Linked Groups
+              </button>
+            )}
+            {isAdmin && (
+              <button
+                onClick={() => setActiveTab('github')}
+                className={`tab-btn ${activeTab === 'github' ? 'active' : ''}`}
+              >
+                GitHub
               </button>
             )}
           </div>
@@ -627,6 +833,273 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {activeTab === 'github' && isAdmin && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+              <div className="card">
+                <h2>GitHub Connection</h2>
+                {githubError && <div className="alert alert-error">{githubError}</div>}
+                {githubSuccess && <div className="alert alert-success">{githubSuccess}</div>}
+
+                {!githubConnection ? (
+                  <>
+                    <p style={{ margin: 0, fontSize: '0.95rem', color: 'var(--text-muted)' }}>
+                      Connect one GitHub account or organization so the bot can read the code when
+                      a group asks about the project. Only an <strong>owner</strong> of that account
+                      can connect it — we verify that with GitHub.
+                    </p>
+                    <ul style={{ fontSize: '0.875rem', color: 'var(--text-muted)', marginTop: '1rem' }}>
+                      {GITHUB_CONNECT_DISCLOSURES.map((line) => (
+                        <li key={line} style={{ marginBottom: '0.35rem' }}>{line}</li>
+                      ))}
+                    </ul>
+                    <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginTop: '1rem' }}>
+                      <button
+                        onClick={handleConnectGithub}
+                        className="btn btn-primary"
+                        disabled={githubBusy}
+                      >
+                        {githubBusy ? 'Working...' : 'Connect GitHub'}
+                      </button>
+                      <button
+                        onClick={handleCreateInvite}
+                        className="btn btn-secondary"
+                        disabled={githubBusy}
+                      >
+                        Invite someone to connect GitHub
+                      </button>
+                    </div>
+                    <p style={{ fontSize: '0.825rem', marginTop: '1rem', marginBottom: 0 }}>
+                      Use <strong>Connect GitHub</strong> if you own the GitHub account yourself.
+                      Use the invite if the account belongs to someone else, such as the developer
+                      who owns the organization — you confirm their connection afterwards.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="table-container">
+                      <table>
+                        <tbody>
+                          <tr>
+                            <th style={{ width: '220px' }}>Status</th>
+                            <td>
+                              <span className={`badge badge-${githubConnection.status === 'active' ? 'active' : 'pending'}`}>
+                                {githubConnection.status === 'pending_confirmation'
+                                  ? 'pending confirmation'
+                                  : githubConnection.status}
+                              </span>
+                            </td>
+                          </tr>
+                          <tr>
+                            <th>GitHub account</th>
+                            <td>
+                              <strong>{githubConnection.account_login}</strong>{' '}
+                              <span style={{ color: 'var(--text-muted)' }}>
+                                ({githubConnection.account_type === 'Organization' ? 'organization' : 'personal account'})
+                              </span>
+                            </td>
+                          </tr>
+                          <tr>
+                            <th>Repository selection</th>
+                            <td>
+                              {githubConnection.repository_selection === 'all'
+                                ? 'All repositories'
+                                : 'Only selected repositories'}
+                            </td>
+                          </tr>
+                          <tr>
+                            <th>Connected by</th>
+                            <td>
+                              {githubConnection.connected_by_github_login
+                                ? `@${githubConnection.connected_by_github_login}`
+                                : 'unknown'}{' '}
+                              <span style={{ color: 'var(--text-muted)' }}>
+                                on {new Date(githubConnection.created_at).toLocaleString()}
+                              </span>
+                            </td>
+                          </tr>
+                          {githubConnection.invited_by_profile_id && (
+                            <tr>
+                              <th>Invited by</th>
+                              <td><code style={{ fontSize: '0.85rem' }}>{githubConnection.invited_by_profile_id}</code></td>
+                            </tr>
+                          )}
+                          {githubConnection.confirmed_by_profile_id && (
+                            <tr>
+                              <th>Confirmed by</th>
+                              <td>
+                                <code style={{ fontSize: '0.85rem' }}>{githubConnection.confirmed_by_profile_id}</code>{' '}
+                                {githubConnection.confirmed_at && (
+                                  <span style={{ color: 'var(--text-muted)' }}>
+                                    on {new Date(githubConnection.confirmed_at).toLocaleString()}
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {githubConnection.repository_selection === 'all' && (
+                      <div className="alert alert-error" style={{ marginTop: '1.5rem' }}>
+                        <strong>All repositories are shared.</strong> {ALL_REPOS_WARNING}
+                      </div>
+                    )}
+
+                    {githubConnection.status === 'pending_confirmation' && (
+                      <div style={{ marginTop: '1.5rem' }}>
+                        <p style={{ fontSize: '0.95rem' }}>
+                          <strong>{githubConnection.account_login}</strong>{' '}
+                          ({githubConnection.repository_selection === 'all'
+                            ? 'all repositories'
+                            : 'selected repositories'}) was connected by{' '}
+                          <strong>@{githubConnection.connected_by_github_login}</strong>. Confirm it
+                          to make repositories linkable, or reject it to free the slot.
+                        </p>
+                        <p style={{ fontSize: '0.95rem' }}>
+                          <strong>
+                            Reject this if you do not recognise{' '}
+                            {githubConnection.connected_by_github_login
+                              ? `@${githubConnection.connected_by_github_login}`
+                              : 'that account'}
+                            .
+                          </strong>{' '}
+                          A connect invite works for whoever opens the link, so a forwarded or
+                          leaked one can reach someone else&apos;s GitHub account. Rejecting frees
+                          the slot and leaves nothing behind; the invite list below shows who used
+                          which invite.
+                        </p>
+                        <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                          <button onClick={handleConfirmConnection} className="btn btn-primary" disabled={githubBusy}>
+                            Confirm
+                          </button>
+                          <button onClick={handleRejectConnection} className="btn btn-danger" disabled={githubBusy}>
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {githubConnection.status !== 'pending_confirmation' && (
+                      <div style={{ marginTop: '1.5rem' }}>
+                        <button onClick={handleDisconnectGithub} className="btn btn-danger" disabled={githubBusy}>
+                          Disconnect GitHub
+                        </button>
+                        <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
+                          Disconnecting removes every repository link in this directory. The owner
+                          can also change the shared repositories, or remove the installation, on
+                          GitHub — that applies here immediately.
+                        </p>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {inviteLink && (
+                <div className="card">
+                  <h2>Connect Invite</h2>
+                  <p style={{ margin: 0, fontSize: '0.95rem', color: 'var(--text-muted)' }}>
+                    Send this link to the person who owns the GitHub account. It works once, expires
+                    in 24 hours, and is shown only now.
+                  </p>
+                  <div
+                    onClick={handleCopyInvite}
+                    className="code-copy-box"
+                    style={{
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      border: '1px dashed rgba(255, 255, 255, 0.15)',
+                      borderRadius: '6px',
+                      padding: '1.25rem',
+                      marginTop: '1.25rem',
+                      cursor: 'pointer',
+                      position: 'relative',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    <div style={{ fontFamily: 'monospace', fontSize: '0.95rem', color: '#60a5fa' }}>
+                      {inviteLink}
+                    </div>
+                    <span style={{ position: 'absolute', right: '12px', top: '12px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                      {inviteCopied ? 'Copied!' : 'Click to Copy'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Shown whichever state the connection is in: an invite that is no longer
+                  usable is still worth revoking if the link leaked. */}
+              {githubInvites.length > 0 && (
+                <div className="card">
+                  <h2>Connect Invites</h2>
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                    Who used which invite. If an invite was used by a GitHub account you do not
+                    recognise, reject the connection above and revoke any invite still pending.
+                  </p>
+                  <div className="table-container" style={{ marginTop: '1.25rem' }}>
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Issued</th>
+                          <th>State</th>
+                          <th>Used by</th>
+                          <th style={{ textAlign: 'right' }}>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {githubInvites.map((inv) => {
+                          const state = inviteState(inv);
+                          return (
+                            <tr key={inv.id}>
+                              <td>{new Date(inv.created_at).toLocaleString()}</td>
+                              <td>
+                                <span className={`badge badge-${state === 'pending' ? 'pending' : 'active'}`}>
+                                  {state}
+                                </span>
+                                {state === 'pending' && (
+                                  <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>
+                                    &nbsp;until {new Date(inv.expires_at).toLocaleString()}
+                                  </span>
+                                )}
+                              </td>
+                              <td>
+                                {inv.completed_by_github_login ? (
+                                  <>
+                                    <strong>@{inv.completed_by_github_login}</strong>
+                                    {inv.consumed_at && (
+                                      <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>
+                                        &nbsp;on {new Date(inv.consumed_at).toLocaleString()}
+                                      </span>
+                                    )}
+                                  </>
+                                ) : (
+                                  <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                )}
+                              </td>
+                              <td style={{ textAlign: 'right' }}>
+                                {state === 'pending' ? (
+                                  <button
+                                    onClick={() => handleRevokeInvite(inv.id)}
+                                    className="btn btn-danger"
+                                    style={{ padding: '0.4rem 0.8rem', fontSize: '0.825rem' }}
+                                  >
+                                    Revoke
+                                  </button>
+                                ) : (
+                                  <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </>

@@ -28,6 +28,7 @@ jobs:
         run: >
           npx tsx --test
           scripts/test-context-file.ts
+          scripts/test-github-owner-check.ts
           scripts/test-push-file.ts
           scripts/test-setup-help.ts
           scripts/test-webhook-secret.ts

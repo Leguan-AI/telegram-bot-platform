@@ -136,6 +136,27 @@ select cron.schedule(
 - **Tunable settings**: The age threshold (`'30 days'`) and batch limit (`10000`) are tunable operational parameters pasted directly in this SQL, not read at runtime.
 - **Throughput ceiling**: The ceiling is `batch limit * runs/day` (10,000 rows/day on a daily schedule). If sustained daily volume approaches this, increase the schedule frequency (e.g. hourly) or transition to partitioning by `created_at` (backlog).
 
+## A5c. Later migrations (operator step)
+
+Every file in `supabase/migrations/` after the init schema is applied the same way, in filename order: **`npx supabase db push`**, run by **you**, the operator. Nothing in the app or in `scripts/` pushes migrations, and no verification step may: the remote migration ledger (`supabase_migrations.schema_migrations`) is written by hand only (see `AGENTS.md`, rules 7–8). A test harness may re-apply an idempotent migration's raw DDL for its own convenience, which does **not** record it — if that happened before you pushed, push afterwards (the `already exists, skipping` notices are the idempotency proof) and confirm with `npx supabase migration list`.
+
+Current migrations that need a push beyond the init schema include:
+
+| Migration | What it adds |
+|---|---|
+| `20260621000000_fix_rls_permissive.sql` | the PERMISSIVE policy fix described in A5 |
+| … | the Phase 1–3 management-plane, group-linking, thread-registry and logging migrations |
+| `20261022000000_dashboard_context_management.sql` | the dashboard context-document functions (`list_context_docs` / `get_managed_context` / `save_managed_context`) — see the dashboard content section below |
+| **`20261022010000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
+
+> After pushing the GitHub App migration, verify the new tables carry both flags:
+> ```sql
+> select relname, relrowsecurity, relforcerowsecurity from pg_class
+> where relnamespace = 'public'::regnamespace
+>   and relname in ('github_installations','repo_links','github_connect_invites');
+> ```
+> All three rows must show `t` / `t`.
+
 ## A6. Table privileges for `bot_service` (now handled by the migration)
 
 ✅ **No action needed here** — table privileges are granted **inside the migration** (section 5, after the `grant execute` lines): `usage` on schema, `select/insert/update/delete` on all tables, sequence usage, and `alter default privileges` for future tables. So A5 already gave `bot_service` the base privileges it needs.
@@ -232,6 +253,12 @@ values (
    | `DEEPSEEK_API_KEY` | your DeepSeek key | **Yes** | **Optional** — required only when using a DeepSeek model (e.g. `deepseek-v4-flash`). |
    | `MODEL_IDENTIFIER` | a current model id, e.g. `claude-sonnet-4-6` or `deepseek-v4-flash` | No | Platform-wide default model (the code checks `MODEL_IDENTIFIER` / `ANTHROPIC_MODEL`). |
    | `GITHUB_WEBHOOK_SECRET` | a strong shared secret | **Yes** | **Only needed if the optional GitHub sync-source is enabled** (not used in v1). Global HMAC secret; generate via password manager. |
+   | `GITHUB_APP_ID` | the GitHub App's App ID | **Yes** | GitHub App (A8e). Signs the App JWT that mints installation tokens. **Not read yet** — the connect flow needs no JWT; set it at registration time anyway. |
+   | `GITHUB_APP_SLUG` | the App slug (`github.com/apps/<slug>`) | **Yes** | GitHub App (A8e). Builds the install URL the GitHub owner is sent to. |
+   | `GITHUB_APP_CLIENT_ID` | the App's Client ID | **Yes** | GitHub App (A8e). Used for the one-shot user-token exchange and its revocation. |
+   | `GITHUB_APP_CLIENT_SECRET` | the App's client secret | **Yes** | GitHub App (A8e). Generated once, shown once. |
+   | `GITHUB_APP_PRIVATE_KEY` | PEM contents of the App private key | **Yes** | GitHub App (A8e). Literal `\n` escapes or a real multi-line value both work. **Not read yet** (arrives with the repo picker and answer-time tools); downloadable only at generation, so store it now. |
+   | `GITHUB_APP_WEBHOOK_SECRET` | the App's webhook secret | **Yes** | GitHub App (A8e). HMAC over the raw body on `/api/webhooks/github`. **Not read yet** (arrives with the webhook route). Distinct from `GITHUB_WEBHOOK_SECRET` above — do not reuse that one. |
    | `NEXT_PUBLIC_SUPABASE_URL` | your Supabase project URL | No | Public by design; required for client-side Auth & DB queries. |
    | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | your Supabase publishable key (`sb_publishable_...`) | No | Public by design (browser-exposed, RLS-enforced); required for client-side Auth & DB. |
    | `NEXT_PUBLIC_APP_NAME` | the brand-config product name | No | Custom branding; defaults to `'Agent Platform'`. |
@@ -262,7 +289,9 @@ values (
    > ```
    > (Alternative: use the **session** pooler on port 5432, which supports prepared statements — but transaction mode + `prepare: false` is the right choice for serverless. Confirm `prepare: false` is set before relying on the deploy.)
 
-   > `[VERIFY]` The current code reads `DATABASE_URL`, `ANTHROPIC_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the client-exposed variables `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_APP_NAME`, and `NEXT_PUBLIC_APP_URL` for brand management and OTP redirects. Confirm no other env vars are expected.
+   > `[VERIFY]` The current code reads `DATABASE_URL`, `ANTHROPIC_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the client-exposed variables `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_APP_NAME`, and `NEXT_PUBLIC_APP_URL` for brand management and OTP redirects. It also reads `DEEPSEEK_API_KEY` (only on a DeepSeek model), `MODEL_IDENTIFIER`, `MODEL_MAX_OUTPUT_TOKENS`, `CONTEXT_MESSAGE_HISTORY_LIMIT`, `APP_HMAC_PEPPER` and `PRIVACY_POLICY_URL`.
+   >
+   > Of the GitHub App variables (A8e), the code reads **`GITHUB_APP_SLUG`, `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET`** today — that is the whole connect flow (`lib/githubApp.ts`, `/api/github/install`, `/api/github/callback`). **`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_APP_WEBHOOK_SECRET` are not read by any code path yet**; they arrive with the installation-token work (repo picker, answer-time tools) and the webhook route. Set them regardless — the private key can only be downloaded at the moment it is generated. Confirm no other env vars are expected.
 
 3. Deploy. Note the production URL Vercel assigns.
 
@@ -394,6 +423,127 @@ The one Vercel project serves every attached domain, so `/privacy` is already li
   ```
 
 > Only **About** and **Privacy Policy** surface on the profile card a group member sees by tapping the bot; **Description** only appears in an empty private chat before Start — so keep nothing load-bearing solely in Description.
+
+## A8e. GitHub App setup (read-only repo access)
+
+> **All of A8e is an operator step.** Registering a GitHub App, generating its secrets and
+> putting them in Vercel cannot be automated from this repo, and nothing in the app or in
+> `scripts/` attempts it. Do it once for the platform; after that, each GitHub account owner
+> self-serves through `/manage` (the connect flow specified in Leguan-AI/telegram-bot-platform#21 §2).
+
+The bot reads private repositories through **one platform-wide GitHub App**, not per-tenant
+PATs. An account owner installs it, picks which repositories it may see, and a directory admin
+binds that installation to their directory. The database stores only the numeric
+`installation_id` — a grant reference, not a credential — so there is no per-tenant secret to
+rotate. The App's private key lives once, in Vercel.
+
+### A8e.1 — Register the App under the Leguan-AI organization
+
+Create it as an **organization-owned** App, not a personal one: the owner name is what installers
+see on the install screen, and any Leguan-AI org owner can then administer it.
+
+**Leguan-AI → Settings → Developer settings → GitHub Apps → New GitHub App.**
+
+| Field | Value |
+|---|---|
+| **GitHub App name** | your public name, e.g. `Leguan Code Reader` |
+| **Description** | must carry the disclosures — see A8e.2 |
+| **Homepage URL** | `https://leguan.ai` |
+| **Callback URL** | `https://app.leguan.ai/api/github/callback` — and **add a second** `http://localhost:3000/api/github/callback` for local development |
+| **Expire user authorization tokens** | **on** |
+| **Request user authorization (OAuth) during installation** | **on** — this is what makes the owner check possible. GitHub then disables the Setup URL and sends installers to the Callback URL with `code`, `installation_id`, `setup_action` and our `state`. |
+| **Redirect on update** | **on** — a changed repository selection comes back through the callback |
+| **Webhook → Active** | **on** |
+| **Webhook URL** | `https://api.kenntnis.ai/api/webhooks/github` (the runtime domain, *not* the dashboard domain) |
+| **Webhook secret** | generate a strong random value; this becomes `GITHUB_APP_WEBHOOK_SECRET` |
+| **Subscribe to events** | **none.** `installation` and `installation_repositories` are delivered to GitHub Apps automatically — do not tick anything. |
+| **Where can this App be installed?** | **Any account.** "Only on this account" would break the connect-invite flow, where the GitHub owner is someone outside Leguan-AI. |
+
+**Permissions — exactly these, nothing else:**
+
+| Scope | Permission | Access | Why |
+|---|---|---|---|
+| Repository | **Contents** | Read-only | reading files and trees |
+| Repository | **Metadata** | Read-only | mandatory for any App |
+| Organization | **Members** | Read-only | the owner check calls `GET /user/memberships/orgs/{org}` with the *installing user's* token. An App's user tokens are capped by the App's own permissions, so without this the check fails for every organization. |
+| Account | — | No access | |
+| Everything else | — | No access | |
+
+> **Members: Read-only is never used while answering.** Installation tokens are downscoped to
+> `contents` + `metadata`, so the bot cannot read org membership. The only token that uses this
+> permission is the user token in the connect callback, which is revoked in the same request.
+
+> `[VERIFY]` Confirm against GitHub's current docs, or with one live org connect, that
+> **Members: Read-only** really is what `GET /user/memberships/orgs/{org}` needs for a GitHub
+> App *user* token. If it is not, drop it from the App's permissions (a 403 on that call surfaces
+> in the UI as "Could not check organization ownership", which is the symptom to watch for).
+
+### A8e.2 — Public description (carries the disclosures)
+
+Whoever installs the App may never see `/help` or the dashboard, so the App's own description has
+to disclose what connecting means. Keep it in step with `lib/githubConnectUi.ts`
+(`GITHUB_CONNECT_DISCLOSURES`), which is the same copy shown on the `/manage` connect panel and the
+connect-invite landing page:
+
+```
+Lets a Leguan AI assistant read the repositories you share, read-only, so it can answer
+your team's questions about the code in Telegram. It never writes code, opens pull
+requests or files issues.
+
+Before you install: repository content may be processed by third-party AI model
+providers to generate answers, and admins of the workspace you connect to will be able
+to make the shared repositories readable by the bot in their Telegram groups. Please
+choose "Only select repositories" — with "All repositories", repositories you create
+later are added automatically. Files that look like secrets (.env files, private keys,
+credential files) are never available to the bot.
+```
+
+### A8e.3 — Generate the client secret and the private key
+
+On the App's settings page, after creating it:
+
+1. **Generate a new client secret** → copy it immediately (it is shown once) → `GITHUB_APP_CLIENT_SECRET`.
+2. **Generate a private key** → a `.pem` downloads → `GITHUB_APP_PRIVATE_KEY`. **This is the only
+   moment it can be obtained**; a lost key must be replaced with a new one.
+3. Note the **App ID** (`GITHUB_APP_ID`), the **Client ID** (`GITHUB_APP_CLIENT_ID`) and the
+   **slug** from the App's public URL `github.com/apps/<slug>` (`GITHUB_APP_SLUG`).
+
+Store all of them in the password manager alongside the `bot_service` password.
+
+### A8e.4 — Add the variables to Vercel (**Sensitive**)
+
+Add all six to the Vercel project (Production, and Preview if you connect repos from previews),
+each marked **Sensitive** — the A7 table lists them. None of them is `NEXT_PUBLIC_*`, so marking
+them Sensitive is correct and does not break any build-time inlining.
+
+For `GITHUB_APP_PRIVATE_KEY`, paste the PEM contents. Either a real multi-line value or a single
+line with literal `\n` escapes works; the JWT signing code handles the escaped form.
+
+Redeploy so the new values are picked up.
+
+### A8e.5 — Check it end to end
+
+1. `supabase db push` has applied `20261022010000_github_app_connect.sql` (A5c).
+
+   > **The push does not have to precede the deploy.** Without the migration, the GitHub tab's
+   > two RPCs fail, are caught, and the tab simply renders its "Connect GitHub" panel with no
+   > connection; pressing a button shows an error. The connect routes return their "Something
+   > went wrong" page. Nothing else in `/manage` or in the bot's answer path touches these
+   > tables, so deploying first costs only a GitHub tab that does not work yet, and applying
+   > the migration afterwards fixes it with no redeploy.
+
+2. In `/manage/entities/{id}` → **GitHub** tab, press **Connect GitHub** as a directory admin of
+   an entity whose GitHub account *you* own. GitHub should show its install screen; choose **Only
+   select repositories**, authorize, and you should land on a "GitHub connected" page, with the
+   tab showing the account, the repository selection and who connected it.
+3. Press **Invite someone to connect GitHub** and open the link yourself in a private window: the
+   landing page should name the directory and show the disclosures. Completing it from an account
+   you own leaves the connection **pending confirmation** until an admin presses **Confirm**.
+4. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
+   (GitHub's own error text is never shown to the user).
+
+> Nothing in this section is per-tenant. A second directory connecting a different GitHub account
+> needs no operator involvement.
 
 ## A9. Platform smoke test (curl — verified)
 
