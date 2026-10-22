@@ -100,8 +100,8 @@ function NextSteps({
       </div>
 
       <p style={s.muted}>
-        On GitHub you can change which repositories are shared, or remove the installation
-        entirely, at any time — the change applies here immediately.
+        On GitHub you can change which repositories are shared, or remove the installation,
+        at any time. The repository list in the dashboard reflects changes immediately.
       </p>
     </>
   );

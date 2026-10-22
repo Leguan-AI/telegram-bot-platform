@@ -1064,7 +1064,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                         <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
                           Disconnecting removes every repository link in this directory. The owner
                           can also change the shared repositories, or remove the installation, on
-                          GitHub — that applies here immediately.
+                          GitHub; the repository list above reflects that immediately.
                         </p>
                       </div>
                     )}
