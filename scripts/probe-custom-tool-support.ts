@@ -24,7 +24,14 @@
 //   DEEPSEEK_PROBE_MODELS  optional. Default: deepseek-flash,deepseek-v4-pro
 //   ANTHROPIC_PROBE_MODELS optional. Default: MODEL_IDENTIFIER when it is a claude-* id,
 //                          else claude-sonnet-5
-//   PROBE_DUMP             optional path; writes every raw request/response as JSON
+//   PROBE_DUMP             optional path; writes every raw request/response as JSON.
+//                          Transcripts hold request and response bodies only, never keys,
+//                          but .gitignore only covers probe-dump*.json / *-probe-dump.json —
+//                          write dumps outside the repo, or match one of those names.
+//   PROBE_REQUIRE_ALL      optional; 1 makes an unreachable requested target an error
+//
+// Exit codes: 0 gate passed, 1 a blocking probe failed, 2 no target was reached
+// (nothing proven), 3 PROBE_REQUIRE_ALL=1 with a target left unproven.
 //
 // Cost note: the mixed-tools probes run real searches. DeepSeek charges no per-search
 // surcharge; Anthropic web_search is $10/1k searches, so the anthropic target costs a
@@ -102,6 +109,8 @@ function buildTargets(): { targets: Target[]; skipped: string[] } {
         client: new Anthropic({ apiKey }),
         requestExtras: {},
         // Matches lib/providers/anthropic.ts on the normal answer path (cacheable: true).
+        // The prompt-caching beta header is obsolete for current models (caching is GA), but
+        // it is what prod sends, and the point of this probe is to mirror prod exactly.
         cacheSystemBlock: true,
         requestOptions: { headers: { 'anthropic-beta': 'prompt-caching-2024-07-31' } },
       });
@@ -444,7 +453,8 @@ async function probeMixedToolsInOneTurn(target: Target, model: string) {
         break;
       }
 
-      sawCustomTool = true;
+      // Name-checked, so adding another custom tool later can't satisfy this probe by accident.
+      if (toolUses.some((t: any) => t.name === READ_FILE_TOOL.name)) sawCustomTool = true;
       messages.push({ role: 'assistant', content: response.content });
       messages.push({
         role: 'user',
@@ -603,10 +613,26 @@ async function main() {
     console.error('Per issue #21 Step 0, stop and revisit the design before building the repo tools.');
     process.exit(1);
   }
+
+  // Everything we were asked about but could not reach: credentials rejected mid-run,
+  // plus targets dropped up front for a missing key.
+  const unproven = [...new Set(skips.map((o) => `${o.target}/${o.model}`)), ...skipped];
+
+  // An unreachable target proves nothing. Never report a pass we did not earn.
+  if (proven.length === 0) {
+    console.error('\n❌ GATE NOT RUN: no target was reached, so nothing is proven.');
+    if (unproven.length > 0) console.error(`   Unproven: ${unproven.join(', ')}`);
+    console.error('Set DEEPSEEK_API_KEY and/or ANTHROPIC_API_KEY to working keys and re-run.');
+    process.exit(2);
+  }
+
   console.log(`\n🎉 GATE PASSED for: ${proven.join(', ')}`);
-  if (skips.length > 0) {
-    const unreachable = [...new Set(skips.map((o) => `${o.target}/${o.model}`))];
-    console.log(`⚠️  NOT PROVEN (credentials unavailable): ${unreachable.join(', ')}`);
+  if (unproven.length > 0) {
+    console.log(`⚠️  NOT PROVEN: ${unproven.join(', ')}`);
+    if (process.env.PROBE_REQUIRE_ALL === '1') {
+      console.error('\n❌ PROBE_REQUIRE_ALL=1 and not every requested target was proven.');
+      process.exit(3);
+    }
   }
 }
 
