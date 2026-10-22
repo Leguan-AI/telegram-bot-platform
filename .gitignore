@@ -47,3 +47,7 @@ next-env.d.ts
 
 # Supabase CLI local state
 supabase/.temp/
+
+# probe transcripts (scripts/probe-custom-tool-support.ts PROBE_DUMP output)
+probe-dump*.json
+*-probe-dump.json
