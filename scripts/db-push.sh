@@ -7,9 +7,11 @@
 # "Cannot find project ref". Passing --project-ref uses your `supabase login` credentials
 # instead, which are global — no link, no database password, no .env.local.
 #
-# Why it refuses a non-interactive shell: AGENTS.md rule 8 reserves migration pushes for
-# the operator, by hand. The tty check keeps CI, a harness or an agent from running it,
-# while staying out of the way of a human in a terminal.
+# What the guards are for (AGENTS.md rule 8, as amended on 2026-10-22): a push must be a
+# deliberate act, never a side effect of something else. The operator at a prompt qualifies,
+# and so does an agent the operator has asked to push — which it signals by setting
+# ALLOW_NONINTERACTIVE_DB_PUSH=1. CI never qualifies, and neither does a test harness or a
+# workflow, none of which has any reason to set that variable.
 #
 # Override the project with SUPABASE_PROJECT_REF=... (e.g. a Supabase branch).
 
@@ -17,14 +19,22 @@ set -euo pipefail
 
 PROJECT_REF="${SUPABASE_PROJECT_REF:-eomnjhbjrkfcpzzbcdho}"
 
-if [ ! -t 0 ]; then
-  cat >&2 <<'MSG'
-db:push is an operator step and refuses to run without a terminal.
+if [ -n "${CI:-}" ]; then
+  echo "db:push refuses to run in CI: migrations never reach the ledger from a workflow (AGENTS.md rule 8)." >&2
+  exit 1
+fi
 
-Migrations reach the remote migration ledger by hand only (AGENTS.md rule 8), so no CI
-job, test harness or agent may push them. Run this yourself:
+if [ ! -t 0 ] && [ "${ALLOW_NONINTERACTIVE_DB_PUSH:-}" != "1" ]; then
+  cat >&2 <<'MSG'
+db:push needs either a terminal or an explicit go-ahead.
+
+A push must be deliberate, never a side effect (AGENTS.md rule 8). Run it yourself:
 
     npm run db:push
+
+An agent pushing because the operator asked it to sets this instead:
+
+    ALLOW_NONINTERACTIVE_DB_PUSH=1 npm run db:push
 
 To see what is pending without applying anything:
 

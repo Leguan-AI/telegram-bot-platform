@@ -152,10 +152,12 @@ Every file in `supabase/migrations/` after the init schema is applied the same w
 > npm run db:push     # apply it (operator only)
 > ```
 >
-> `npm run db:push` **refuses to run without a terminal**, which is rule 8 made
-> mechanical: CI, a test harness or an agent cannot push migrations, only a person at a
-> prompt can. Point either command at another project (a Supabase branch, say) with
-> `SUPABASE_PROJECT_REF=<ref> npm run db:status`.
+> `npm run db:push` makes rule 8 mechanical rather than honour-system: it **refuses in CI**
+> outright, and outside an interactive terminal it requires
+> `ALLOW_NONINTERACTIVE_DB_PUSH=1`. So a person at a prompt just runs it, an agent you have
+> asked to push sets that variable, and a workflow or test harness — neither of which has
+> any reason to set it — cannot push by accident. Point either command at another project
+> (a Supabase branch, say) with `SUPABASE_PROJECT_REF=<ref> npm run db:status`.
 >
 > The database **test harnesses** are a separate matter: they are plain Postgres clients
 > that read `ADMIN_DATABASE_URL` / `DATABASE_URL`, and `.env.local` is gitignored, so it
