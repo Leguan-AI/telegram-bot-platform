@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "check:scripts": "tsc --noEmit -p tsconfig.scripts.json"
+    "check:scripts": "tsc --noEmit -p tsconfig.scripts.json",
+    "db:status": "bash scripts/db-remote.sh status",
+    "db:push": "bash scripts/db-remote.sh push"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
