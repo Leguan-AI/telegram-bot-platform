@@ -383,3 +383,22 @@ tr:last-child td {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
+
+/* Context editor */
+.context-textarea {
+  min-height: 280px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+.context-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}

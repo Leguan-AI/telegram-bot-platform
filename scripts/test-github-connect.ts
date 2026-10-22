@@ -1,22 +1,30 @@
 // Adversarial test suite for the GitHub App connect flow and repo-link schema (#21 §2, §3).
 // Run with: node --env-file=.env.local node_modules/tsx/dist/cli.mjs scripts/test-github-connect.ts
 //
+// WARNING: this harness inserts and deletes fixture rows in auth.users, public.entities,
+// public.groups and public.threads (all UUID-scoped). Run it against a Supabase branch or
+// staging database, NOT production: an interrupted run would leave fake auth users and
+// entities behind. In production, verify with the /manage GitHub tab instead.
+//
 // OPERATOR-RUN ONLY. Per AGENTS.md rule 1 the database behind ADMIN_DATABASE_URL /
-// DATABASE_URL is production: every row this script touches is a fixture UUID, every
-// delete is scoped to those fixtures, and it performs no destructive DDL. It re-applies
-// the (idempotent) connect migration as a convenience for repeat runs — the migration
-// still reaches the remote ledger only through the operator's own `supabase db push`
-// (AGENTS.md rules 7 and 8), which must happen BEFORE the first run of this script.
+// DATABASE_URL is production unless you point it elsewhere: every row this script touches
+// is a fixture UUID, every delete is scoped to those fixtures, and it performs no
+// destructive DDL. It re-applies the (idempotent) connect migration as a convenience for
+// repeat runs — the migration still reaches the remote ledger only through the operator's
+// own `supabase db push` (AGENTS.md rules 7 and 8), which must happen BEFORE the first run
+// of this script.
 //
 // Scope: everything decided inside Postgres — token lifecycle, the entity-from-token
 // rule, one-installation-per-entity, confirm/reject/disconnect gating, the narrow-only
 // pin trigger, the NULLS NOT DISTINCT constraint, cascades and RLS posture. The checks
 // that happen at GitHub (forged installation_id, non-owner, mismatched account.id) are
-// covered without a database or network by scripts/test-github-owner-check.ts.
+// covered without a database or network by scripts/test-github-owner-check.ts, which runs
+// in CI with the other pure unit tests.
 //
-// Both scripts are standalone, like the rest of scripts/: there is no runner yet, so
-// neither is wired into CI. That gap is #22 — once it lands, the owner-check script
-// belongs in the unit suite and this one in the operator-only `test:db` suite.
+// This harness stays out of CI, like every other script that needs a database URL. The
+// remaining half of #22 — an `npm test` / `npm run test:db` split with a guardrail that
+// refuses a database suite in CI unless it points at an ephemeral database — is still
+// open; until it lands, this script is run by hand.
 
 import postgres from 'postgres';
 import assert from 'assert';
@@ -171,7 +179,7 @@ async function main() {
       `;
 
     console.log('--- Applying Migration Schema (idempotent re-apply) ---');
-    const migrationPath = path.join(__dirname, '../supabase/migrations/20261022000000_github_app_connect.sql');
+    const migrationPath = path.join(__dirname, '../supabase/migrations/20261022010000_github_app_connect.sql');
     await sql.unsafe(fs.readFileSync(migrationPath, 'utf8'));
 
     console.log('--- Setting Up Test Environment ---');

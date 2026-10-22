@@ -2,7 +2,7 @@
  * GitHub connect flow — database capabilities (#21 §2).
  *
  * Server-side only. These call the two `bot_service`-only SECURITY DEFINER functions
- * from 20261022000000_github_app_connect.sql; the /manage half of the flow (mint, list,
+ * from 20261022010000_github_app_connect.sql; the /manage half of the flow (mint, list,
  * revoke, confirm, reject) is called straight from the browser as `authenticated`, which
  * is why it has no wrapper here.
  *

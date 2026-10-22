@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
 import '../manage.css';
+import { MAX_CONTEXT_BYTES, contextByteLength, decodeContextFile, contextErrorMessage, ContextFileError } from '@/lib/contextFile';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'Agent Platform';
 
@@ -25,6 +26,10 @@ export default function Dashboard() {
   const [showModal, setShowModal] = useState(false);
   const [formError, setFormError] = useState('');
   const [formLoading, setFormLoading] = useState(false);
+  const [newContext, setNewContext] = useState('');
+  // Set when the entity was created but saving its initial context failed
+  const [createdEntityId, setCreatedEntityId] = useState<string | null>(null);
+  const contextFileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -69,23 +74,57 @@ export default function Dashboard() {
         throw new Error('Please fill in all fields.');
       }
 
-      const { error } = await supabase
+      if (contextByteLength(newContext) > MAX_CONTEXT_BYTES) {
+        throw new Error(`Initial context is too large (max ${MAX_CONTEXT_BYTES / 1024} KB).`);
+      }
+
+      const { data: created, error } = await supabase
         .from('entities')
         .insert({
           display_name: newDisplayName.trim(),
           slug: slugVal,
-        });
+        })
+        .select('id')
+        .single();
 
       if (error) throw error;
+
+      if (newContext.trim()) {
+        const { error: ctxErr } = await supabase.rpc('save_managed_context', {
+          p_entity: created.id,
+          p_group: null,
+          p_content: newContext,
+          p_expected_updated_at: null,
+        });
+        if (ctxErr) {
+          setCreatedEntityId(created.id);
+          fetchEntities();
+          throw new Error(`The entity was created, but its initial context could not be saved: ${contextErrorMessage(ctxErr.message)} You can add it on the entity page.`);
+        }
+      }
 
       setShowModal(false);
       setNewDisplayName('');
       setNewSlug('');
-      fetchEntities();
+      setNewContext('');
+      // Land on the new entity so the next step (context, then linking a group) is in front of them
+      router.push(`/manage/entities/${created.id}`);
     } catch (err: any) {
       setFormError(err.message || 'Failed to create entity.');
     } finally {
       setFormLoading(false);
+    }
+  };
+
+  const handleContextFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setFormError('');
+    try {
+      setNewContext(decodeContextFile(await file.arrayBuffer()));
+    } catch (err: any) {
+      setFormError(err instanceof ContextFileError ? err.message : 'Could not read that file.');
     }
   };
 
@@ -173,11 +212,52 @@ export default function Dashboard() {
                   required
                 />
               </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="initialContext">Initial context (recommended)</label>
+                <textarea
+                  id="initialContext"
+                  className="form-control context-textarea"
+                  style={{ minHeight: '160px' }}
+                  placeholder="Background the bot should answer from: who you are, how things work, key terms. Markdown or plain text. You can add or change this later."
+                  value={newContext}
+                  onChange={(e) => setNewContext(e.target.value)}
+                  disabled={formLoading || createdEntityId !== null}
+                />
+                <div style={{ marginTop: '0.5rem' }}>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => contextFileInput.current?.click()}
+                    disabled={formLoading || createdEntityId !== null}
+                  >
+                    Upload .md / .txt
+                  </button>
+                  <input
+                    ref={contextFileInput}
+                    type="file"
+                    accept=".md,.markdown,.txt,text/plain,text/markdown"
+                    onChange={handleContextFile}
+                    style={{ display: 'none' }}
+                  />
+                </div>
+              </div>
               <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end', marginTop: '2rem' }}>
-                <button type="button" onClick={() => setShowModal(false)} className="btn btn-secondary">Cancel</button>
-                <button type="submit" className="btn btn-primary" disabled={formLoading}>
-                  {formLoading ? 'Creating...' : 'Create'}
+                <button
+                  type="button"
+                  onClick={() => { setShowModal(false); setCreatedEntityId(null); setFormError(''); }}
+                  className="btn btn-secondary"
+                >
+                  {createdEntityId ? 'Close' : 'Cancel'}
                 </button>
+                {createdEntityId ? (
+                  <Link href={`/manage/entities/${createdEntityId}`} className="btn btn-primary">
+                    Open entity
+                  </Link>
+                ) : (
+                  <button type="submit" className="btn btn-primary" disabled={formLoading}>
+                    {formLoading ? 'Creating...' : 'Create'}
+                  </button>
+                )}
               </div>
             </form>
           </div>

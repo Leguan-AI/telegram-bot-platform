@@ -146,7 +146,8 @@ Current migrations that need a push beyond the init schema include:
 |---|---|
 | `20260621000000_fix_rls_permissive.sql` | the PERMISSIVE policy fix described in A5 |
 | … | the Phase 1–3 management-plane, group-linking, thread-registry and logging migrations |
-| **`20261022000000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
+| `20261022000000_dashboard_context_management.sql` | the dashboard context-document functions (`list_context_docs` / `get_managed_context` / `save_managed_context`) — see the dashboard content section below |
+| **`20261022010000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
 
 > After pushing the GitHub App migration, verify the new tables carry both flags:
 > ```sql
@@ -522,7 +523,7 @@ Redeploy so the new values are picked up.
 
 ### A8e.5 — Check it end to end
 
-1. `supabase db push` has applied `20261022000000_github_app_connect.sql` (A5c).
+1. `supabase db push` has applied `20261022010000_github_app_connect.sql` (A5c).
 2. In `/manage/entities/{id}` → **GitHub** tab, press **Connect GitHub** as a directory admin of
    an entity whose GitHub account *you* own. GitHub should show its install screen; choose **Only
    select repositories**, authorize, and you should land on a "GitHub connected" page, with the
@@ -587,7 +588,8 @@ Platform setup is complete. Everything below is per-entity (Part B), done once p
 >
 > **Current onboarding surfaces (a hybrid, by honest design):**
 > - **Create entity** — web dashboard (`/manage`), or SQL (B1 below).
-> - **Seed content** — SQL upsert into `doc_cache` (B2 below). *Interim* — see the signpost there.
+> - **Seed content** — the dashboard's **Entity Context** editor (General Settings tab, or the optional
+>   initial-context box when creating the entity); SQL upsert into `doc_cache` (B2 below) is the advanced fallback.
 > - **Bind a group** — `/auth` in Telegram, fully self-service (B3 below).
 >
 > **v1 content model:** content lives **directly in the `doc_cache` table** — no GitHub in the v1
@@ -633,11 +635,15 @@ returning id;
 
 ## B2. Seed content into the cache + manifest
 
-> **⚠️ Interim step — moving to the dashboard.** Direct SQL is the *current* way to give an entity
-> content; it is the manual stand-in for a **content-management UI** that doesn't exist yet (planned:
-> a "Documents"/"Context" tab in `/manage`, mirroring the Linked Groups pattern — see Open Items and
-> `docs/VISION.md`, Surface 1). When that ships, this SQL becomes the advanced/fallback path. Treat
-> the SQL below as the *current reality*, not the intended permanent flow.
+> **Preferred path: the dashboard.** In `/manage`, open the entity → **General Settings → Entity Context**
+> to write or upload (`.md`/`.txt`, up to 256 KB) the document that applies to *every* group of the entity,
+> or **Linked Groups → Manage** on a group row for that group's own document. You can also paste initial
+> context while creating the entity. Owners, admins and editors can edit; viewers read. Each scope has one
+> dashboard-managed document; documents added by `/push` or SQL appear in the same lists, read-only.
+> *Requires migration `20261022000000_dashboard_context_management.sql` (operator: `supabase db push`).*
+>
+> The SQL below is the advanced/fallback path (bulk seeding, or when you want several named documents per
+> scope).
 
 The bot answers from `doc_cache`. In v1 you push content **directly** into it (no GitHub sync). Run
 in the SQL editor as `postgres`.
@@ -846,7 +852,7 @@ select vault.update_secret(
 
 **Per-bot secrets (in Vault):** the platform bot's telegram bot token + telegram webhook secret, referenced by `bots.token_secret_ref` / `bots.webhook_secret_ref` (UUID-as-text). (A per-entity GitHub token on `entities.github_token_id` exists only if the optional GitHub sync-source is enabled.)
 
-**Content (v1):** lives directly in `doc_cache`, pushed via SQL (B2) — *interim*, moving to a `/manage` content tab. No GitHub in the v1 path; the store is abstracted so sync-sources (GitHub/Drive/Notion/etc.) can populate the cache later — see `docs/VISION.md`.
+**Content (v1):** lives directly in `doc_cache`, edited from the `/manage` dashboard (entity-wide and per-group documents) or pushed via `/push` / SQL (B2). No GitHub in the v1 path; the store is abstracted so sync-sources (GitHub/Drive/Notion/etc.) can populate the cache later — see `docs/VISION.md`.
 
 **The four `SECURITY DEFINER` RLS-bypass functions** (the only sanctioned bypass surfaces): `resolve_entity_id_by_slug`, `resolve_entity_id_by_repo` (GitHub sync, dormant in v1), `get_current_entity_secret` (entity-scoped secret access — `github_token_id`, plus the now-unused telegram refs until Phase 3.1 drops them), and `get_current_bot_secret` (Phase 3 — scopes Vault access to the current bot's token/webhook secret). Plus two non-secret bootstrap resolvers granted to `bot_service`: `resolve_bot_id_by_slug` and `resolve_entity_id_by_chat`. See `SECURITY-PROPOSAL.md` and `docs/specs/SPEC-phase-3-bot-cutover.md`.
 
@@ -859,7 +865,7 @@ select vault.update_secret(
 - **`prepare: false` in `lib/supabase.ts`** (A7) — ✅ confirmed set; required for the Supavisor transaction pooler.
 - **`scripts/sync-commands.ts` is updated** (A8c) — ✅ repointed to iterate active platform bots (`bots` table) and decrypt tokens via `get_current_bot_secret`. Bulk-syncs all active bots from the shared command list in `lib/commands.ts`.
 - **Phase 3.1 deferred cleanup** — once the platform bot is trusted in production: drop the now-unused `entities.telegram_bot_token_id` / `telegram_webhook_secret_id` / `telegram_bot_username` columns + modify `get_current_entity_secret` to drop their refs (keep `github_token_id`); delete the retired bots' Vault secrets; `/deletebot` the old bots in BotFather. Manual migration in `supabase/manual/`; snapshot the `entities` table first (a manual `pg_dump`/`select` suffices — data already mirrored into `bots`). See `docs/specs/SPEC-phase-3-bot-cutover.md` §9.
-- **Content management in the dashboard** (B2) — v1 content is pushed via manual SQL upserts (the *interim* path). Planned: a "Documents"/"Context" tab in `/manage` (mirroring the Linked Groups pattern) that writes to `doc_cache` through a clean function/API boundary — which is also the seam a future sync-source/connector would target (see `docs/VISION.md`, Surface 1). Until then, B2's SQL is the content path.
+- **Content management in the dashboard** (B2) — ✅ first version shipped: one dashboard-managed document per scope (entity-wide, per group) with optimistic-concurrency saves, `.md`/`.txt` upload, and read-only lists of every document (including `/push` and SQL-added ones) via `list_context_docs` / `get_managed_context` / `save_managed_context` (migration `20261022000000_dashboard_context_management.sql`; harness `scripts/test-dashboard-context.ts`). Not yet built: editing/deleting individual `/push`-added or per-topic documents, multiple named documents per scope, Markdown preview.
 - **`github_*` columns relaxed to nullable** (B1) — ✅ done (migration `20260624000000_relax_github_columns.sql`). The entity insert omits the nullable `github_*` columns in v1. (Future: a `sync_sources` refactor could move GitHub config out of `entities` when the content-store abstraction is formalized.) **Coordinated code change done:** the `Entity` TS interface in `lib/capabilities.ts` marks the `github_*` fields as `string | null`; the GitHub sync route has a config-completeness guard.
 - **`checkVaultSecretsHealth` is not exposed via any route** (A9) — wire it to a small admin/health endpoint for pre-launch verification (also a natural home for a privacy-mode check via `getMe`).
 - **`package.json` name is still `temp-next`** — rename to the project.

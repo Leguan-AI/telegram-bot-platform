@@ -1,4 +1,4 @@
--- Migration: 20261022000000_github_app_connect.sql
+-- Migration: 20261022010000_github_app_connect.sql
 -- GitHub App connect flow: installations, repo links, connect invites (#21 §2, §3 DB notes)
 --
 -- Idempotent throughout (AGENTS.md rule 5): create table if not exists / create index
