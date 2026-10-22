@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState, use } from 'react';
+import { Fragment, useEffect, useState, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
 import '../../manage.css';
+import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'Agent Platform';
 
@@ -56,6 +57,11 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [linkedGroups, setLinkedGroups] = useState<any[]>([]);
 
+  // Context documents (visible to every member; editing is gated in the RPC and the UI)
+  const [contextDocs, setContextDocs] = useState<ContextDoc[]>([]);
+  const [contextLoaded, setContextLoaded] = useState(false);
+  const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null);
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (!session) {
@@ -66,6 +72,16 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
       }
     });
   }, [router, entityId]);
+
+  const refreshContextDocs = async () => {
+    const { data, error } = await supabase.rpc('list_context_docs', { p_entity: entityId });
+    if (error) {
+      console.warn('Failed to load context documents:', error);
+      return;
+    }
+    setContextDocs((data || []) as ContextDoc[]);
+    setContextLoaded(true);
+  };
 
   const loadEntityData = async () => {
     setLoading(true);
@@ -95,7 +111,10 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
       if (authsErr) throw authsErr;
       setAuthorizations(authsData || []);
 
-      // 3. Fetch Linked Groups (gated for owner/admin in RPC)
+      // 3. Fetch context documents
+      await refreshContextDocs();
+
+      // 4. Fetch Linked Groups (gated for owner/admin in RPC)
       const { data: { session } } = await supabase.auth.getSession();
       const sessionUser = session?.user;
       const isOwnerUser = entityData.owner_profile_id === sessionUser?.id;
@@ -257,6 +276,11 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
 
   const isOwner = entity?.owner_profile_id === user?.id;
   const isAdmin = isOwner || authorizations.some((auth) => auth.profile_id === user?.id && auth.role === 'admin' && auth.status === 'active');
+  const canEditContext = isOwner || authorizations.some(
+    (auth) => auth.profile_id === user?.id && (auth.role === 'admin' || auth.role === 'editor') && auth.status === 'active'
+  );
+  const entityDocs = contextDocs.filter((d) => d.scope === 'entity');
+  const groupDocs = (groupId: string) => contextDocs.filter((d) => d.group_id === groupId);
 
   return (
     <div className="manage-container">
@@ -309,6 +333,34 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
           </div>
 
           {activeTab === 'settings' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+            <div className="card">
+              <h2>Entity Context</h2>
+              {contextLoaded && contextDocs.length === 0 && (
+                <div className="alert alert-info">
+                  The bot has no context yet, so it has nothing to answer from. Add some background below to get started.
+                </div>
+              )}
+              <p style={{ fontSize: '0.95rem' }}>
+                This document applies to <strong>every group</strong> linked to this entity. Write or upload the background
+                the bot should rely on: who you are, how things work, key terms. You can add more specific context to an
+                individual group from the Linked Groups tab.
+              </p>
+              <ContextEditor
+                key="entity-context"
+                entityId={entity.id}
+                groupId={null}
+                canEdit={canEditContext}
+                onSaved={refreshContextDocs}
+              />
+              {entityDocs.length > 0 && (
+                <div style={{ marginTop: '2rem' }}>
+                  <h3>Documents that apply to the whole entity</h3>
+                  <ContextDocTable docs={entityDocs} />
+                </div>
+              )}
+            </div>
+
             <div className="card">
               <h2>Directory Settings</h2>
               {entitySuccess && <div className="alert alert-success">{entitySuccess}</div>}
@@ -343,6 +395,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                   {saveLoading ? 'Saving...' : 'Save Settings'}
                 </button>
               </form>
+            </div>
             </div>
           )}
 
@@ -522,16 +575,53 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                           <th>Group Name</th>
                           <th>Telegram Chat ID</th>
                           <th>Linked Date</th>
+                          <th>Context</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {linkedGroups.map((g) => (
-                          <tr key={g.id}>
-                            <td><strong>{g.display_name}</strong></td>
-                            <td><code>{g.telegram_chat_id}</code></td>
-                            <td>{new Date(g.created_at).toLocaleString()}</td>
-                          </tr>
-                        ))}
+                        {linkedGroups.map((g) => {
+                          const docsForGroup = groupDocs(g.id);
+                          const expanded = expandedGroupId === g.id;
+                          return (
+                            <Fragment key={g.id}>
+                              <tr>
+                                <td><strong>{g.display_name}</strong></td>
+                                <td><code>{g.telegram_chat_id}</code></td>
+                                <td>{new Date(g.created_at).toLocaleString()}</td>
+                                <td>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    onClick={() => setExpandedGroupId(expanded ? null : g.id)}
+                                  >
+                                    {docsForGroup.length} document{docsForGroup.length === 1 ? '' : 's'} · {expanded ? 'Close' : 'Manage'}
+                                  </button>
+                                </td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={4} style={{ background: 'rgba(15, 23, 42, 0.4)' }}>
+                                    <h3>Group context for {g.display_name}</h3>
+                                    <p style={{ fontSize: '0.9rem' }}>
+                                      Applies only to this group, in addition to the entity-wide context.
+                                    </p>
+                                    <ContextEditor
+                                      key={`group-context-${g.id}`}
+                                      entityId={entity.id}
+                                      groupId={g.id}
+                                      canEdit={canEditContext}
+                                      onSaved={refreshContextDocs}
+                                    />
+                                    <div style={{ marginTop: '2rem' }}>
+                                      <h3>Documents for this group</h3>
+                                      <ContextDocTable docs={docsForGroup} />
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

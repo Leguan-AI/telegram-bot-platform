@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck app
+        run: npx tsc --noEmit
+      - name: Typecheck scripts
+        run: npm run check:scripts
+      # Only the pure unit tests (no database access). The DB harnesses (scripts/test-*.ts that need
+      # ADMIN_DATABASE_URL / DATABASE_URL) must never run in CI against the shared database.
+      - name: Unit tests
+        run: >
+          npx tsx --test
+          scripts/test-context-file.ts
+          scripts/test-push-file.ts
+          scripts/test-setup-help.ts
+          scripts/test-webhook-secret.ts
