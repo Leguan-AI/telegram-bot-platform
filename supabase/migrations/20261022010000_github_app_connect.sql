@@ -338,14 +338,29 @@ $$;
 grant execute on function public.mint_github_connect_token(uuid, text) to authenticated;
 
 
--- Pending invites for the /manage list. 'direct' states are plumbing, not invites, so
+-- Connect invites for the /manage list. 'direct' states are plumbing, not invites, so
 -- they are excluded.
+--
+-- It returns consumed and revoked invites as well as pending ones, with the GitHub login
+-- that completed each: an admin confirming a connection needs to see which invite it came
+-- from and who used it, and a leaked link is worth recognising after the fact. The caller
+-- derives the state from consumed_at / revoked_at / expires_at.
+--
+-- The drop is here because the earlier shape of this function returned fewer columns, and
+-- `create or replace` cannot change a function's return type; it keeps the migration
+-- re-appliable (AGENTS.md rule 5).
+drop function if exists public.list_github_connect_invites(uuid);
+
 create or replace function public.list_github_connect_invites(p_entity uuid)
 returns table (
-  id          uuid,
-  issued_by   uuid,
-  created_at  timestamptz,
-  expires_at  timestamptz
+  id                        uuid,
+  issued_by                 uuid,
+  created_at                timestamptz,
+  expires_at                timestamptz,
+  consumed_at               timestamptz,
+  revoked_at                timestamptz,
+  completed_by_github_login text,
+  installation_id           bigint
 )
 language plpgsql
 security definer
@@ -362,14 +377,13 @@ begin
   perform set_config('app.current_entity_id', p_entity::text, true);
 
   return query
-  select i.id, i.issued_by, i.created_at, i.expires_at
+  select i.id, i.issued_by, i.created_at, i.expires_at,
+         i.consumed_at, i.revoked_at, i.completed_by_github_login, i.installation_id
   from public.github_connect_invites i
   where i.entity_id = p_entity
     and i.kind = 'invite'
-    and i.consumed_at is null
-    and i.revoked_at is null
-    and i.expires_at > now()
-  order by i.created_at desc;
+  order by i.created_at desc
+  limit 20;
 end;
 $$;
 

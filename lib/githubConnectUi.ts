@@ -41,6 +41,7 @@ export type ConnectResultCode =
   | 'entity_slot_taken'
   // owner check
   | 'not_owner'
+  | 'installation_suspended'
   | 'account_mismatch'
   | 'membership_forbidden'
   | 'unsupported_account'
@@ -112,6 +113,11 @@ const RESULT_COPY: Record<ConnectResultCode, ConnectResultCopy> = {
   not_owner: {
     title: 'Only an owner can connect this account',
     body: 'Connecting needs an owner of the GitHub account or organization — access to a repository, or plain organization membership, is not enough. Nothing was recorded.',
+    tone: 'error',
+  },
+  installation_suspended: {
+    title: 'That installation is suspended on GitHub',
+    body: 'Nothing was recorded. Unsuspend the app in the GitHub account or organization settings, then open the link again.',
     tone: 'error',
   },
   account_mismatch: {

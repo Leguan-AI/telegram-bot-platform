@@ -7,6 +7,7 @@ import { test, after } from 'node:test';
 import assert from 'assert';
 
 import {
+  assertInstallationNotSuspended,
   assertInstallationOwner,
   buildInstallUrl,
   findUserInstallation,
@@ -233,6 +234,36 @@ test('org login is URL-encoded in the membership call', async () => {
   ]);
   await assertInstallationOwner('tok', { id: 7001, login: 'dev' }, { ...orgInstallation, accountLogin: 'a b' });
   assert.ok(calls[0].url.endsWith('/user/memberships/orgs/a%20b'), `Unexpected URL: ${calls[0].url}`);
+});
+
+// ---------------------------------------------------------------------------
+// Check three: a suspended installation cannot be connected at all. Recording it as
+// status='suspended' would let the §4 unsuspend webhook activate an invite-flow
+// connection no workspace admin ever confirmed, so the connect is refused instead.
+// ---------------------------------------------------------------------------
+
+test('a suspended installation is reported as suspended, not as active', async () => {
+  stubFetch([
+    {
+      match: '/user/installations',
+      status: 200,
+      body: userInstallationsBody([{ ...rawOrgInstallation, suspended_at: '2026-10-01T00:00:00Z' }]),
+    },
+  ]);
+  const found = await findUserInstallation('tok', 4242);
+  assert.strictEqual(found?.suspended, true);
+});
+
+test('a suspended installation is refused', () => {
+  assert.throws(
+    () => assertInstallationNotSuspended({ ...orgInstallation, suspended: true }),
+    (err: any) => err instanceof GitHubConnectError && err.reason === 'installation_suspended'
+  );
+});
+
+test('an unsuspended installation passes the guard', () => {
+  assertInstallationNotSuspended(orgInstallation);
+  assertInstallationNotSuspended(personalInstallation);
 });
 
 // ---------------------------------------------------------------------------

@@ -662,9 +662,73 @@ async function main() {
     console.log('✅ Test 16 Passed.');
 
     // =========================================================================
-    // Test 17: deleting an entity takes its GitHub state with it
+    // Test 17: the /manage invite list shows who used which invite
     // =========================================================================
-    console.log('Test 17: entity cascade...');
+    console.log('Test 17: invite list...');
+    await expectCode(
+      '42501',
+      () =>
+        runAsUser(sql!, STRANGER, 'gh_stranger@test.com', (tx) =>
+          tx`select * from public.list_github_connect_invites(${E2})`
+        ),
+      'Test 17 stranger list'
+    );
+
+    const idOf = async (code: string) =>
+      (
+        await sql!<{ id: string }[]>`
+          select id from public.github_connect_invites where token_hash = encode(sha256(${code}::bytea), 'hex')
+        `
+      )[0].id;
+
+    const listed = await runAsUser(sql, OWNER_B, 'gh_owner_b@test.com', (tx) =>
+      tx<any[]>`select * from public.list_github_connect_invites(${E2})`
+    );
+
+    // E2 minted four 'invite' tokens (expired, revoked, and two consumed) plus one
+    // 'direct' state in Test 6 — which is plumbing, not an invite, and must not appear.
+    const inviteKindCount = await sql<{ c: string }[]>`
+      select count(*)::text as c from public.github_connect_invites where entity_id = ${E2} and kind = 'invite'
+    `;
+    const allKindCount = await sql<{ c: string }[]>`
+      select count(*)::text as c from public.github_connect_invites where entity_id = ${E2}
+    `;
+    assert.strictEqual(inviteKindCount[0].c, '4', 'Test 17: unexpected invite fixture count');
+    assert.ok(Number(allKindCount[0].c) > 4, 'Test 17: expected a direct state alongside the invites');
+    assert.strictEqual(listed.length, 4, 'Test 17: direct states must not be listed as invites');
+
+    const byId = new Map(listed.map((row) => [row.id, row]));
+    const consumedRow = byId.get(await idOf(inviteCode2));
+    assert.ok(consumedRow, 'Test 17: the consumed invite is missing from the list');
+    assert.strictEqual(
+      consumedRow.completed_by_github_login,
+      'devperson',
+      'Test 17: the list does not say who used the invite'
+    );
+    assert.strictEqual(
+      consumedRow.installation_id.toString(),
+      INSTALL_2,
+      'Test 17: the list does not say which installation the invite produced'
+    );
+    assert.ok(consumedRow.consumed_at, 'Test 17: consumed_at missing');
+
+    const revokedRow = byId.get(await idOf(revokable));
+    assert.ok(revokedRow, 'Test 17: the revoked invite is missing from the list');
+    assert.ok(revokedRow.revoked_at, 'Test 17: revoked_at missing');
+    assert.strictEqual(revokedRow.consumed_at, null, 'Test 17: a revoked invite cannot be consumed');
+    assert.strictEqual(revokedRow.completed_by_github_login, null, 'Test 17: a revoked invite has no completer');
+
+    const expiredRow = byId.get(await idOf(expiring));
+    assert.ok(expiredRow, 'Test 17: the expired invite is missing from the list');
+    assert.strictEqual(expiredRow.consumed_at, null, 'Test 17: the expired invite was consumed');
+    assert.strictEqual(expiredRow.revoked_at, null, 'Test 17: the expired invite was revoked');
+    assert.ok(expiredRow.expires_at < new Date(), 'Test 17: the expired invite is not in the past');
+    console.log('✅ Test 17 Passed.');
+
+    // =========================================================================
+    // Test 18: deleting an entity takes its GitHub state with it
+    // =========================================================================
+    console.log('Test 18: entity cascade...');
     await sql`delete from public.entities where id = ${E2}`;
     const leftovers = await sql<{ installs: string; invites: string; links: string }[]>`
       select
@@ -672,10 +736,10 @@ async function main() {
         (select count(*)::text from public.github_connect_invites where entity_id = ${E2}) as invites,
         (select count(*)::text from public.repo_links where entity_id = ${E2}) as links
     `;
-    assert.strictEqual(leftovers[0].installs, '0', 'Test 17: installation survived its entity');
-    assert.strictEqual(leftovers[0].invites, '0', 'Test 17: invites survived their entity');
-    assert.strictEqual(leftovers[0].links, '0', 'Test 17: repo links survived their entity');
-    console.log('✅ Test 17 Passed.');
+    assert.strictEqual(leftovers[0].installs, '0', 'Test 18: installation survived its entity');
+    assert.strictEqual(leftovers[0].invites, '0', 'Test 18: invites survived their entity');
+    assert.strictEqual(leftovers[0].links, '0', 'Test 18: repo links survived their entity');
+    console.log('✅ Test 18 Passed.');
 
     console.log('\n🎉 ALL GITHUB CONNECT TESTS PASSED SUCCESSFULLY! 🎉');
   } catch (error) {

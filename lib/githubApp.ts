@@ -194,6 +194,24 @@ export async function findUserInstallation(
 }
 
 /**
+ * Refuses a suspended installation (#21 §5 treats `suspended` as "repo tools
+ * unavailable"). Nothing is recorded, so the entity's slot stays free and the owner can
+ * unsuspend the App on GitHub and come back.
+ *
+ * Recording it as `status = 'suspended'` instead would be worse on the invite path: the
+ * §4 `installation.unsuspend` webhook flips a suspended row to `active`, which would
+ * activate a connection no workspace admin ever confirmed. A connect that cannot reach
+ * `pending_confirmation` must not be stored at all.
+ *
+ * Call it only after the owner check, so a suspension is reported to owners alone.
+ */
+export function assertInstallationNotSuspended(installation: GitHubInstallation): void {
+  if (installation.suspended) {
+    throw new GitHubConnectError('installation_suspended', 'Installation is suspended on GitHub');
+  }
+}
+
+/**
  * The owner check (§2). Repo access, or plain org membership, is not enough.
  *
  * - personal installation: the authorizing user's id must equal the installation's

@@ -39,6 +39,18 @@ interface GithubInvite {
   issued_by: string;
   created_at: string;
   expires_at: string;
+  consumed_at: string | null;
+  revoked_at: string | null;
+  completed_by_github_login: string | null;
+  installation_id: number | null;
+}
+
+/** Revoked / used / expired / pending — derived, so the list needs no server-side state. */
+function inviteState(inv: GithubInvite): 'revoked' | 'used' | 'expired' | 'pending' {
+  if (inv.revoked_at) return 'revoked';
+  if (inv.consumed_at) return 'used';
+  if (new Date(inv.expires_at).getTime() <= Date.now()) return 'expired';
+  return 'pending';
 }
 
 interface Authorization {
@@ -947,6 +959,19 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                           <strong>@{githubConnection.connected_by_github_login}</strong>. Confirm it
                           to make repositories linkable, or reject it to free the slot.
                         </p>
+                        <p style={{ fontSize: '0.95rem' }}>
+                          <strong>
+                            Reject this if you do not recognise{' '}
+                            {githubConnection.connected_by_github_login
+                              ? `@${githubConnection.connected_by_github_login}`
+                              : 'that account'}
+                            .
+                          </strong>{' '}
+                          A connect invite works for whoever opens the link, so a forwarded or
+                          leaked one can reach someone else&apos;s GitHub account. Rejecting frees
+                          the slot and leaves nothing behind; the invite list below shows who used
+                          which invite.
+                        </p>
                         <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
                           <button onClick={handleConfirmConnection} className="btn btn-primary" disabled={githubBusy}>
                             Confirm
@@ -1009,32 +1034,67 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                   usable is still worth revoking if the link leaked. */}
               {githubInvites.length > 0 && (
                 <div className="card">
-                  <h2>Pending Connect Invites</h2>
-                  <div className="table-container">
+                  <h2>Connect Invites</h2>
+                  <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                    Who used which invite. If an invite was used by a GitHub account you do not
+                    recognise, reject the connection above and revoke any invite still pending.
+                  </p>
+                  <div className="table-container" style={{ marginTop: '1.25rem' }}>
                     <table>
                       <thead>
                         <tr>
                           <th>Issued</th>
-                          <th>Expires</th>
+                          <th>State</th>
+                          <th>Used by</th>
                           <th style={{ textAlign: 'right' }}>Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {githubInvites.map((inv) => (
-                          <tr key={inv.id}>
-                            <td>{new Date(inv.created_at).toLocaleString()}</td>
-                            <td>{new Date(inv.expires_at).toLocaleString()}</td>
-                            <td style={{ textAlign: 'right' }}>
-                              <button
-                                onClick={() => handleRevokeInvite(inv.id)}
-                                className="btn btn-danger"
-                                style={{ padding: '0.4rem 0.8rem', fontSize: '0.825rem' }}
-                              >
-                                Revoke
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                        {githubInvites.map((inv) => {
+                          const state = inviteState(inv);
+                          return (
+                            <tr key={inv.id}>
+                              <td>{new Date(inv.created_at).toLocaleString()}</td>
+                              <td>
+                                <span className={`badge badge-${state === 'pending' ? 'pending' : 'active'}`}>
+                                  {state}
+                                </span>
+                                {state === 'pending' && (
+                                  <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>
+                                    &nbsp;until {new Date(inv.expires_at).toLocaleString()}
+                                  </span>
+                                )}
+                              </td>
+                              <td>
+                                {inv.completed_by_github_login ? (
+                                  <>
+                                    <strong>@{inv.completed_by_github_login}</strong>
+                                    {inv.consumed_at && (
+                                      <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>
+                                        &nbsp;on {new Date(inv.consumed_at).toLocaleString()}
+                                      </span>
+                                    )}
+                                  </>
+                                ) : (
+                                  <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                )}
+                              </td>
+                              <td style={{ textAlign: 'right' }}>
+                                {state === 'pending' ? (
+                                  <button
+                                    onClick={() => handleRevokeInvite(inv.id)}
+                                    className="btn btn-danger"
+                                    style={{ padding: '0.4rem 0.8rem', fontSize: '0.825rem' }}
+                                  >
+                                    Revoke
+                                  </button>
+                                ) : (
+                                  <span style={{ color: 'var(--text-muted)', fontSize: '0.825rem' }}>—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

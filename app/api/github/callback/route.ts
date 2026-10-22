@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
+  assertInstallationNotSuspended,
   assertInstallationOwner,
   exchangeUserCode,
   findUserInstallation,
@@ -84,6 +85,9 @@ export async function GET(req: NextRequest) {
     // Check two: they must own the account the installation belongs to.
     await assertInstallationOwner(userToken, user, installation);
 
+    // A suspended installation cannot be connected at all — see the note on the guard.
+    assertInstallationNotSuspended(installation);
+
     const result = await completeGitHubConnect({
       code: state,
       installationId: installation.id,
@@ -94,6 +98,15 @@ export async function GET(req: NextRequest) {
       githubUserId: user.id,
       githubLogin: user.login,
     });
+
+    if (result.outcome === 'already_connected') {
+      // The owner re-ran the flow, most likely to change the repo selection; the account
+      // login and selection we just stored overwrote what was there.
+      console.info(
+        `GitHub connect: refreshed installation ${installation.id} on entity ${result.entityId} ` +
+          `(status ${result.status}, repository_selection ${result.repositorySelection}).`
+      );
+    }
 
     return redirectToStatus(req, result.outcome, result.repositorySelection);
   } catch (err) {
@@ -121,6 +134,7 @@ export async function GET(req: NextRequest) {
 function mapGitHubReason(reason: string): ConnectResultCode {
   switch (reason) {
     case 'not_owner':
+    case 'installation_suspended':
     case 'account_mismatch':
     case 'membership_forbidden':
     case 'unsupported_account':
