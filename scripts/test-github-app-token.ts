@@ -7,6 +7,7 @@ import assert from 'assert';
 import { createVerify, generateKeyPairSync } from 'node:crypto';
 
 import {
+  METADATA_ONLY_PERMISSIONS,
   READ_ONLY_REPO_PERMISSIONS,
   canMintInstallationTokens,
   listInstallationRepositories,
@@ -167,6 +168,21 @@ test('an empty repository list is refused instead of sent', async () => {
   assert.strictEqual(calls.length, 0, 'nothing should have been sent to GitHub');
 });
 
+// The picker and the save endpoint only ever need to *name* repositories, so their token
+// is narrowed to metadata and cannot read a line of code.
+test('a metadata-only token asks for metadata and nothing else', async () => {
+  stubFetch([{ match: '/access_tokens', status: 201, body: { token: 'ghs_z', expires_at: 'later' } }]);
+  await mintInstallationToken({
+    installationId: 42,
+    permissions: { ...METADATA_ONLY_PERMISSIONS },
+  });
+
+  const sent = JSON.parse(calls[0].body || '{}');
+  assert.deepStrictEqual(sent.permissions, { metadata: 'read' });
+  assert.ok(!('contents' in sent.permissions), 'the picker token must not carry contents');
+  assert.ok(!('repository_ids' in sent), 'the picker must see every shared repository');
+});
+
 test('404 and 403 from the token endpoint are distinguished', async () => {
   stubFetch([{ match: '/access_tokens', status: 404, body: {} }]);
   await assert.rejects(
@@ -205,6 +221,26 @@ test('repositories are mapped, with a default branch always present', async () =
     { id: 1, fullName: 'acme/api', private: true, defaultBranch: 'trunk', description: 'Backend' },
     { id: 2, fullName: 'acme/empty', private: true, defaultBranch: 'main', description: null },
   ]);
+});
+
+// A silently short list would make the save endpoint reject a repository that really is
+// shared, so hitting the page cap has to be an error rather than a truncation.
+test('hitting the page cap throws instead of returning a partial list', async () => {
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 1,
+    full_name: `acme/repo-${i + 1}`,
+    private: true,
+    default_branch: 'main',
+    description: null,
+  }));
+  stubFetch([
+    { match: '/installation/repositories', status: 200, body: { total_count: 5000, repositories: fullPage } },
+  ]);
+
+  await assert.rejects(
+    () => listInstallationRepositories('ghs_x'),
+    (err: any) => err instanceof GitHubTokenError && err.reason === 'repository_list_truncated'
+  );
 });
 
 test('a failed listing is reported rather than returning a short list', async () => {

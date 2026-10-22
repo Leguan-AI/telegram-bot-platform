@@ -138,7 +138,7 @@ select cron.schedule(
 
 ## A5c. Later migrations (operator step)
 
-Every file in `supabase/migrations/` after the init schema is applied the same way, in filename order: **`npm run db:push`** (a thin wrapper over `supabase db push`), run by **you**, the operator. Nothing in the app or in `scripts/` pushes migrations, and no verification step may: the remote migration ledger (`supabase_migrations.schema_migrations`) is written by hand only (see `AGENTS.md`, rules 7–8). A test harness may re-apply an idempotent migration's raw DDL for its own convenience, which does **not** record it — if that happened before you pushed, push afterwards (the `already exists, skipping` notices are the idempotency proof) and confirm with `npm run db:status`.
+Every file in `supabase/migrations/` after the init schema is applied the same way, in filename order: **`npm run db:push`** (a wrapper over `supabase db push` — see the worktree note below), run by **you**, or by an agent for a push you have explicitly approved (`AGENTS.md` rule 8). Nothing in the app or in `scripts/` pushes migrations, and no verification step may: the remote migration ledger (`supabase_migrations.schema_migrations`) is written by hand only (see `AGENTS.md`, rules 7–8). A test harness may re-apply an idempotent migration's raw DDL for its own convenience, which does **not** record it — if that happened before you pushed, push afterwards (the `already exists, skipping` notices are the idempotency proof) and confirm with `npm run db:status`.
 
 > **Pushing from a git worktree.** The CLI keeps its project link in `supabase/.temp`,
 > which is untracked, so a fresh worktree is **unlinked** and a bare `supabase db push`
@@ -148,16 +148,22 @@ Every file in `supabase/migrations/` after the init schema is applied the same w
 > global `supabase login` rather than on a link, a database password or `.env.local`:
 >
 > ```bash
-> npm run db:status   # what is pending, read-only
-> npm run db:push     # apply it (operator only)
+> SUPABASE_PROJECT_REF=<ref> npm run db:status                   # what is pending, read-only
+> CONFIRM_PROD=1 SUPABASE_PROJECT_REF=<ref> npm run db:push      # apply it
 > ```
 >
-> `npm run db:push` makes rule 8 mechanical rather than honour-system: it **refuses in CI**
-> outright, and outside an interactive terminal it requires
-> `ALLOW_NONINTERACTIVE_DB_PUSH=1`. So a person at a prompt just runs it, an agent you have
-> asked to push sets that variable, and a workflow or test harness — neither of which has
-> any reason to set it — cannot push by accident. Point either command at another project
-> (a Supabase branch, say) with `SUPABASE_PROJECT_REF=<ref> npm run db:status`.
+> **The target is never implied.** `SUPABASE_PROJECT_REF` has no default, so an unset
+> variable cannot silently mean production, and pushing to the production project also
+> needs `CONFIRM_PROD=1`. Every push **dry-runs first and prints what it would apply**
+> before applying it, then prints the ledger.
+>
+> The script also makes rule 8's boundaries mechanical rather than honour-system: it
+> **refuses in CI** outright, and outside an interactive terminal it requires
+> `ALLOW_NONINTERACTIVE_DB_PUSH=1`. A person at a prompt just runs it; an agent pushing a
+> push you approved sets that variable; a workflow or test harness, which has no reason to
+> set it, cannot push by accident. What the script cannot check — whether your approval was
+> explicit, whether the migration is destructive, what the rollback is — is spelled out in
+> `AGENTS.md` rule 8.
 >
 > The database **test harnesses** are a separate matter: they are plain Postgres clients
 > that read `ADMIN_DATABASE_URL` / `DATABASE_URL`, and `.env.local` is gitignored, so it

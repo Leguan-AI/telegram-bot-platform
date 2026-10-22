@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getProfileIdFromRequest } from '@/lib/manageAuth';
 import { getConnectionForAdmin, RepoLinkError } from '@/lib/repoLinks';
 import {
+  METADATA_ONLY_PERMISSIONS,
   canMintInstallationTokens,
   listInstallationRepositories,
   mintInstallationToken,
@@ -48,7 +49,12 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: connection.status }, { status: 409 });
     }
 
-    const token = await mintInstallationToken({ installationId: connection.installationId });
+    // Unscoped by repository — the picker must see everything the owner shared — but
+    // `metadata` only, so this token cannot read a line of code.
+    const token = await mintInstallationToken({
+      installationId: connection.installationId,
+      permissions: { ...METADATA_ONLY_PERMISSIONS },
+    });
     const repositories = await listInstallationRepositories(token.token);
 
     return NextResponse.json({

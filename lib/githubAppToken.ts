@@ -22,6 +22,13 @@ const API_VERSION = '2022-11-28';
 /** Read-only scope for an answer-time token. Deliberately excludes `members`. */
 export const READ_ONLY_REPO_PERMISSIONS = { contents: 'read', metadata: 'read' } as const;
 
+/**
+ * Scope for a token that only has to *name* repositories — the /manage picker and the save
+ * endpoint's re-check. `GET /installation/repositories` needs `metadata` alone, so neither
+ * token can read a single line of code, even though the App itself may.
+ */
+export const METADATA_ONLY_PERMISSIONS = { metadata: 'read' } as const;
+
 export interface InstallationToken {
   token: string;
   expiresAt: string;
@@ -184,8 +191,11 @@ export async function mintInstallationToken(input: {
  */
 export async function listInstallationRepositories(token: string): Promise<InstallationRepository[]> {
   const repositories: InstallationRepository[] = [];
+  // 100 per page. Far beyond any real installation — but a silently short list would make
+  // the save endpoint reject a repository that *is* shared, so hitting the cap throws.
+  const maxPages = 20;
 
-  for (let page = 1; page <= 20; page++) {
+  for (let page = 1; page <= maxPages; page++) {
     const res = await fetch(`${GITHUB_API}/installation/repositories?per_page=100&page=${page}`, {
       headers: installationHeaders(token),
     });
@@ -220,7 +230,16 @@ export async function listInstallationRepositories(token: string): Promise<Insta
       });
     }
 
-    if (page_repos.length < 100) break;
+    if (page_repos.length < 100) {
+      return repositories;
+    }
+
+    if (page === maxPages) {
+      throw new GitHubTokenError(
+        'repository_list_truncated',
+        `Installation has more than ${maxPages * 100} repositories; raise the page cap rather than trusting a short list.`
+      );
+    }
   }
 
   return repositories;

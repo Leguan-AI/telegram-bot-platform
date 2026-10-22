@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getProfileIdFromRequest } from '@/lib/manageAuth';
 import { getConnectionForAdmin, setRepoLinks, RepoLinkError } from '@/lib/repoLinks';
 import {
+  METADATA_ONLY_PERMISSIONS,
   canMintInstallationTokens,
   listInstallationRepositories,
   mintInstallationToken,
@@ -83,7 +84,12 @@ export async function POST(req: NextRequest) {
     // The re-check. Only a save that clears the set can skip asking GitHub, since an empty
     // selection cannot smuggle anything in.
     if (repoIds.length > 0) {
-      const token = await mintInstallationToken({ installationId: connection.installationId });
+      // Unscoped by repository — the picker must see everything the owner shared — but
+    // `metadata` only, so this token cannot read a line of code.
+    const token = await mintInstallationToken({
+      installationId: connection.installationId,
+      permissions: { ...METADATA_ONLY_PERMISSIONS },
+    });
       const available = new Set(
         (await listInstallationRepositories(token.token)).map((repo) => repo.id)
       );
