@@ -524,6 +524,14 @@ Redeploy so the new values are picked up.
 ### A8e.5 — Check it end to end
 
 1. `supabase db push` has applied `20261022010000_github_app_connect.sql` (A5c).
+
+   > **The push does not have to precede the deploy.** Without the migration, the GitHub tab's
+   > two RPCs fail, are caught, and the tab simply renders its "Connect GitHub" panel with no
+   > connection; pressing a button shows an error. The connect routes return their "Something
+   > went wrong" page. Nothing else in `/manage` or in the bot's answer path touches these
+   > tables, so deploying first costs only a GitHub tab that does not work yet, and applying
+   > the migration afterwards fixes it with no redeploy.
+
 2. In `/manage/entities/{id}` → **GitHub** tab, press **Connect GitHub** as a directory admin of
    an entity whose GitHub account *you* own. GitHub should show its install screen; choose **Only
    select repositories**, authorize, and you should land on a "GitHub connected" page, with the
