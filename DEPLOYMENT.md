@@ -791,7 +791,7 @@ Each target sends the request shape its own provider sends — `lib/providers/de
 disabled, no `cache_control`) and `lib/providers/anthropic.ts` with `cacheable: true`
 (`cache_control: ephemeral` plus the prompt-caching beta header) — so a pass transfers to
 production. `PROBE_TARGETS`, `DEEPSEEK_PROBE_MODELS`, `ANTHROPIC_PROBE_MODELS`, `PROBE_DUMP` and
-`PROBE_REQUIRE_ALL` are documented in `.env.example`; **none of them belong in Vercel.**
+`PROBE_REQUIRE_ALL` are documented in the script's header comment; **none of them belong in Vercel.**
 
 Read the exit code, not just the output: **0** passed, **1** a blocking probe failed, **2** no
 target was reached so nothing is proven, **3** `PROBE_REQUIRE_ALL=1` with a target left unproven.
