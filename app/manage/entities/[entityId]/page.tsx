@@ -4,7 +4,11 @@ import { Fragment, useEffect, useState, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
-import { GITHUB_CONNECT_DISCLOSURES, ALL_REPOS_WARNING } from '@/lib/githubConnectUi';
+import {
+  GITHUB_CONNECT_DISCLOSURES,
+  ALL_REPOS_WARNING,
+  ALL_REPOS_SHARED_NOTE,
+} from '@/lib/githubConnectUi';
 import '../../manage.css';
 import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
 import { RepoLinkSection, type RepoLinkRow, type RepoOption } from './RepoLinkEditor';
@@ -1001,9 +1005,11 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                       </table>
                     </div>
 
+                    {/* Informational, not an error: the connection is fine, the scope is
+                        simply wider than we recommend. */}
                     {githubConnection.repository_selection === 'all' && (
-                      <div className="alert alert-error" style={{ marginTop: '1.5rem' }}>
-                        <strong>All repositories are shared.</strong> {ALL_REPOS_WARNING}
+                      <div className="alert alert-info" style={{ marginTop: '1.5rem' }}>
+                        <strong>All repositories are shared.</strong> {ALL_REPOS_SHARED_NOTE}
                       </div>
                     )}
 

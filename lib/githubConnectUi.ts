@@ -22,7 +22,17 @@ export const GITHUB_CONNECT_DISCLOSURES: string[] = [
  * GitHub tab.
  */
 export const ALL_REPOS_WARNING =
-  'Please choose "Only select repositories" on the GitHub screen. With "All repositories", workspace admins can link any repository in the account to a Telegram group — including repositories created later, which GitHub adds to the installation automatically.';
+  'With "All repositories", workspace admins can link any repository in the account to a Telegram group — including repositories created later, which GitHub adds to the installation automatically. Choosing "Only select repositories" instead keeps that list under your control.';
+
+/**
+ * The same point once the choice has already been made, where "please choose" would read
+ * as a verdict on a connection that in fact succeeded.
+ */
+export const ALL_REPOS_SHARED_NOTE =
+  'That is allowed, and the connection is fine — but it means workspace admins can link any repository in the account to a Telegram group, including ones created later, which GitHub adds automatically. You can narrow it to specific repositories at any time from the GitHub installation settings.';
+
+/** Where an owner changes or removes what they shared. Lists every installation they own. */
+export const GITHUB_INSTALLATIONS_URL = 'https://github.com/settings/installations';
 
 /** Outcome of a callback, as carried in the status page's `result` parameter. */
 export type ConnectResultCode =
@@ -53,6 +63,17 @@ export type ConnectResultCode =
   | 'github_error'
   | 'server_error';
 
+/**
+ * Which flow produced this outcome. The next step differs: a /manage admin who connected
+ * their own account goes back to the dashboard, while an invitee has no account here and
+ * is simply done.
+ */
+export type ConnectFlow = 'direct' | 'invite';
+
+export function parseConnectFlow(value: string | undefined): ConnectFlow | null {
+  return value === 'direct' || value === 'invite' ? value : null;
+}
+
 export interface ConnectResultCopy {
   title: string;
   body: string;
@@ -62,12 +83,12 @@ export interface ConnectResultCopy {
 const RESULT_COPY: Record<ConnectResultCode, ConnectResultCopy> = {
   connected: {
     title: 'GitHub connected',
-    body: 'The repositories you shared are now available to the workspace. Its admins decide which Telegram groups can use them.',
+    body: 'The repositories you shared are now available to the workspace, and nothing further is needed from you here. Which Telegram groups can read which repository is decided in the dashboard, under the GitHub tab.',
     tone: 'success',
   },
   pending_confirmation: {
     title: 'Almost there — the workspace admin will confirm',
-    body: 'Thanks. The admin who sent you this invite now has to confirm the connection. Until they do, no repository can be linked to a group and the bot cannot read anything.',
+    body: 'Thanks — nothing else is needed from you. The admin who sent you this invite now has to confirm the connection; until they do, no repository can be linked to a group and the bot cannot read anything.',
     tone: 'pending',
   },
   already_connected: {

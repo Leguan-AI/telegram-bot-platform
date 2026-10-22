@@ -108,7 +108,10 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    return redirectToStatus(req, result.outcome, result.repositorySelection);
+    return redirectToStatus(req, result.outcome, result.repositorySelection, {
+      flow: result.kind,
+      entityId: result.entityId,
+    });
   } catch (err) {
     if (err instanceof ConnectDbError) {
       console.warn(`GitHub connect refused: ${err.reason}`);
@@ -150,12 +153,19 @@ function mapGitHubReason(reason: string): ConnectResultCode {
 function redirectToStatus(
   req: NextRequest,
   result: ConnectResultCode,
-  selection?: 'all' | 'selected'
+  selection?: 'all' | 'selected',
+  context?: { flow: 'direct' | 'invite'; entityId: string }
 ): NextResponse {
   const url = new URL('/github/connect/status', req.nextUrl.origin);
   url.searchParams.set('result', result);
   if (selection) {
     url.searchParams.set('selection', selection);
+  }
+  // Only ever set on success, where we know both for certain. The status page validates
+  // them anyway: an enum and a UUID, so neither can put text on the page.
+  if (context) {
+    url.searchParams.set('flow', context.flow);
+    url.searchParams.set('entity', context.entityId);
   }
   return NextResponse.redirect(url);
 }
