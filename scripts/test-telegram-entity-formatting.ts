@@ -484,9 +484,15 @@ async function main() {
     console.log('✅ Test 17 Passed.');
 
     // =========================================================================
-    // Test 18: logModelCall records scope ID and type with spread priority
+    // Test 18: logModelCall records only the fields it names
+    //
+    // It used to spread `result.raw` into metadata, which this test guarded against by
+    // passing colliding values. Since #21 §8 the spread is gone and metadata is an
+    // explicit list, so `raw` is ignored entirely — the stronger guarantee. The hostile
+    // values stay here to prove it: nothing from the provider's response reaches the
+    // column, whether it collides with a named field or not.
     // =========================================================================
-    console.log('Test 18: Verifying logModelCall metadata spread priority...');
+    console.log('Test 18: Verifying logModelCall metadata is an explicit list...');
 
     const testResult = {
       text: 'Final response',
@@ -494,6 +500,7 @@ async function main() {
       model: 'deepseek-v4-flash',
       requestId: 'real-request-id',
       stopReason: 'end_turn',
+      // Ignored: no longer spread, and no provider sets it.
       raw: {
         isolationScopeId: 'clobbered-val',
         requestId: 'clobbered-id',
@@ -525,6 +532,11 @@ async function main() {
     assert.strictEqual(loggedMetadata.isolationScopeType, 'group', 'Controlled isolationScopeType must win');
     assert.strictEqual(loggedMetadata.requestId, 'real-request-id', 'Controlled requestId must win');
     assert.strictEqual(loggedMetadata.telegramThreadId, null, 'Controlled telegramThreadId must win');
+    assert.deepStrictEqual(
+      Object.keys(loggedMetadata).sort(),
+      ['isolationScopeId', 'isolationScopeType', 'requestId', 'stopReason', 'telegramThreadId'],
+      'metadata must carry nothing but the fields logModelCall names'
+    );
 
     console.log('✅ Test 18 Passed.');
 

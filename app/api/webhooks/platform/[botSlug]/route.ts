@@ -1,5 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { waitUntil } from '@vercel/functions';
+
+/**
+ * An answer that reads repositories runs a tool loop (#21 §7), and every slow step in it
+ * answers to one deadline fixed at the start of the request — see lib/answerBudget.ts,
+ * which also holds the arithmetic this number has to cover. Kept as a literal because
+ * Next requires route segment config to be statically analysable; test-answer-budget.ts
+ * asserts it still matches ANSWER_MAX_DURATION_SECONDS.
+ */
+export const maxDuration = 140;
 import { sql, withTenantContext, withBotContext } from '@/lib/supabase';
 import {
   resolveUser,
@@ -36,7 +45,7 @@ import {
 } from '@/lib/telegram';
 import { getModelIdentifier, ANTHROPIC_DOCUMENT_MODEL } from '@/lib/config';
 import { DocumentReadError } from '@/lib/model';
-import { getUnlinkedHelp, UNLINKED_NUDGE } from '@/lib/setupHelp';
+import { buildLinkedHelp, getUnlinkedHelp, UNLINKED_NUDGE } from '@/lib/setupHelp';
 import { isPushableTextFile, decodePushedFile, PushFileError, MAX_PUSH_FILE_BYTES } from '@/lib/pushFile';
 import {
   shouldAnnounceFirstAdd,
@@ -45,6 +54,7 @@ import {
   NOTICE_ON_JOIN,
 } from '@/lib/privacy';
 import { rejectUnlessValidTelegramSecret } from '@/lib/webhookAuth';
+import { startAnswerDeadline } from '@/lib/answerBudget';
 import {
   buildContextRepoLine,
   buildRepoListing,
@@ -82,6 +92,11 @@ interface RouteParams {
 }
 
 export async function POST(req: NextRequest, { params }: RouteParams) {
+  // Fixed here, before any work: everything slow downstream measures itself against this
+  // one instant, so resolving the bot, building context and reading repositories all come
+  // out of the same allowance rather than each getting a fresh one (#37 review B1).
+  const deadline = startAnswerDeadline();
+
   try {
     const { botSlug } = await params;
 
@@ -654,12 +669,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     if (isHelpCommand) {
       waitUntil(
         (async () => {
-          const helpText = `<b>Telegram Bot Platform Help</b>\n\n` +
-            `• Use <code>/context</code> to see what documentation I'm answering from in this topic.\n` +
-            `• Use <code>/push topic</code> or <code>/push group</code> as a <i>reply</i> to a message, or as the caption of an attached .txt/.md file, to save it as context for the topic or group (group admins only).\n` +
-            `• Use <code>/recap [N]</code> to summarize the last N messages here (default 20).\n` +
-            `• Use <code>/whoami</code> to show this chat's ids (useful for setup/diagnostics).\n` +
-            `• Mention me <code>@${botUsername} &lt;question&gt;</code> inside a topic to ask a question.`;
+          const helpText = buildLinkedHelp(botUsername);
 
           await sendMessage(bot.telegram_bot_token, message.chat.id, helpText, {
             threadId,
@@ -1318,7 +1328,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
                 threadId,
                 replyToMessageId: message.message_id,
                 initialStatus: STATUS_QUESTION,
-                work: async () => answerQuestion({
+                work: async (updateStatus) => answerQuestion({
+                  deadline,
                   entityId: entity.id,
                   groupId: group.id,
                   threadId: threadId,
@@ -1326,6 +1337,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
                   model: bot.model,
                   persona: bot.persona,
                   botId,
+                  // Replaces the status line while the repository tools run (#21 §7), so a
+                  // 90-second answer shows what it is doing instead of a typing dot.
+                  onStatus: updateStatus,
                 }),
                 mapError: () => '⚠️ Sorry, something went wrong while processing your request.',
               });

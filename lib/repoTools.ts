@@ -19,6 +19,7 @@
  * session object and no longer.
  */
 
+import { GITHUB_CALL_TIMEOUT_MS, type Deadline } from '@/lib/answerBudget';
 import {
   METADATA_ONLY_PERMISSIONS,
   READ_ONLY_REPO_PERMISSIONS,
@@ -64,6 +65,12 @@ const BUDGET_SPENT: ToolResult = {
 
 const RATE_LIMITED = 'GitHub is rate-limiting these requests. I could not read any more from the repository.';
 
+/** Both names a cancelled fetch arrives under. */
+function isTimeout(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 export class RepoToolSession {
   private token: string | null = null;
   private readonly repos = new Map<string, RepoState>();
@@ -86,11 +93,53 @@ export class RepoToolSession {
       installationId: number;
       repos: ScopedRepoRef[];
       limits?: Partial<RepoToolLimits>;
+      /**
+       * The answer's deadline (#37 review B1). Every GitHub request is bounded by it, so
+       * a slow response costs the answer at most one timeout rather than the function's
+       * whole remaining life. Optional: without one, each request keeps its own timeout.
+       */
+      deadline?: Deadline;
     }
   ) {
     this.limits = { ...DEFAULT_LIMITS, ...(input.limits || {}) };
     for (const ref of input.repos) {
       this.repos.set(ref.fullName.toLowerCase(), { ref });
+    }
+  }
+
+  /**
+   * Dispatches one model-issued tool call.
+   *
+   * The arguments are whatever the model sent, so each field is checked for its type
+   * rather than cast: a `path` that arrives as a number or an object would otherwise
+   * reach normalizeRepoPath, which expects a string. An unknown tool name is answered,
+   * not thrown — the loop needs a tool_result for every tool_use.
+   */
+  async run(name: string, input: Record<string, unknown>): Promise<ToolResult> {
+    const repo = typeof input.repo === 'string' ? input.repo : undefined;
+
+    switch (name) {
+      case 'list_tree':
+        return this.listTree({
+          repo,
+          path: typeof input.path === 'string' ? input.path : undefined,
+          depth: typeof input.depth === 'number' && Number.isFinite(input.depth) ? input.depth : undefined,
+        });
+
+      case 'read_file':
+        if (typeof input.path !== 'string') {
+          return { content: 'read_file needs a `path`.', isError: true };
+        }
+        return this.readFile({ repo, path: input.path });
+
+      case 'search_code':
+        if (typeof input.query !== 'string') {
+          return { content: 'search_code needs a `query`.', isError: true };
+        }
+        return this.searchCode({ repo, query: input.query });
+
+      default:
+        return { content: `There is no tool called ${JSON.stringify(name)}.`, isError: true };
     }
   }
 
@@ -333,6 +382,16 @@ export class RepoToolSession {
     };
   }
 
+  /**
+   * One request's worth of time: the shorter of the per-call timeout and whatever is left
+   * of the answer's deadline.
+   */
+  private callSignal(): AbortSignal {
+    return this.input.deadline
+      ? this.input.deadline.signal(GITHUB_CALL_TIMEOUT_MS)
+      : AbortSignal.timeout(GITHUB_CALL_TIMEOUT_MS);
+  }
+
   /** The downscoped token for this answer, minted at most once. */
   private async getToken(): Promise<string> {
     if (this.token) return this.token;
@@ -341,6 +400,7 @@ export class RepoToolSession {
       installationId: this.input.installationId,
       repositoryIds,
       permissions: { ...READ_ONLY_REPO_PERMISSIONS },
+      signal: this.callSignal(),
     });
     this.token = token.token;
     return this.token;
@@ -475,8 +535,15 @@ export class RepoToolSession {
           Authorization: `Bearer ${token}`,
           ...extraHeaders,
         },
+        signal: this.callSignal(),
       });
     } catch (err) {
+      // A timeout is reported as itself: "GitHub was slow" and "GitHub refused" lead a
+      // model to different next moves, and only one of them is worth retrying.
+      if (isTimeout(err)) {
+        console.warn(`Repository request timed out: ${url.split('?')[0]}`);
+        return { error: { content: 'GitHub did not answer in time. Try a smaller read.', isError: true } };
+      }
       console.warn('Repository request failed:', err);
       return { error: { content: 'I could not reach GitHub just now.', isError: true } };
     }

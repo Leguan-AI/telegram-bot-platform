@@ -16,6 +16,8 @@
 
 import { createSign } from 'node:crypto';
 
+import { GITHUB_CALL_TIMEOUT_MS } from '@/lib/answerBudget';
+
 const GITHUB_API = 'https://api.github.com';
 const API_VERSION = '2022-11-28';
 
@@ -143,6 +145,8 @@ export async function mintInstallationToken(input: {
   installationId: number;
   repositoryIds?: number[];
   permissions?: Record<string, string>;
+  /** A caller holding an answer deadline passes its own, already clamped to it. */
+  signal?: AbortSignal;
 }): Promise<InstallationToken> {
   if (input.repositoryIds && input.repositoryIds.length === 0) {
     throw new GitHubTokenError(
@@ -160,6 +164,7 @@ export async function mintInstallationToken(input: {
     method: 'POST',
     headers: { ...appHeaders(jwt), 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: input.signal ?? AbortSignal.timeout(GITHUB_CALL_TIMEOUT_MS),
   });
 
   if (res.status === 404) {
@@ -189,7 +194,10 @@ export async function mintInstallationToken(input: {
  * Every repository the installation can see, for the /manage picker. Needs an unscoped
  * token: a downscoped one would only list what it was already narrowed to.
  */
-export async function listInstallationRepositories(token: string): Promise<InstallationRepository[]> {
+export async function listInstallationRepositories(
+  token: string,
+  signal?: AbortSignal
+): Promise<InstallationRepository[]> {
   const repositories: InstallationRepository[] = [];
   // 100 per page. Far beyond any real installation — but a silently short list would make
   // the save endpoint reject a repository that *is* shared, so hitting the cap throws.
@@ -198,6 +206,9 @@ export async function listInstallationRepositories(token: string): Promise<Insta
   for (let page = 1; page <= maxPages; page++) {
     const res = await fetch(`${GITHUB_API}/installation/repositories?per_page=100&page=${page}`, {
       headers: installationHeaders(token),
+      // Per page, and the loop can run to 20 of them: without this, one slow response
+      // holds up an answer that has a deadline of its own (#37 review B1).
+      signal: signal ?? AbortSignal.timeout(GITHUB_CALL_TIMEOUT_MS),
     });
 
     if (!res.ok) {

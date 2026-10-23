@@ -62,6 +62,12 @@ export interface CallModelInput {
    * the cache at the worst moment, on the call that has the most context behind it.
    */
   toolChoice?: { type: 'none' | 'auto' | 'any' };
+  /**
+   * Cancels the request in flight. The tool loop sets one per call so a model that is
+   * still thinking when the time budget expires is dropped rather than waited out — the
+   * route's maxDuration would otherwise kill the whole answer, status message and all.
+   */
+  signal?: AbortSignal;
 }
 
 export interface CallModelResult {
@@ -85,7 +91,6 @@ export interface CallModelResult {
   content?: any[];
   /** Thinking tokens, where the provider reports them (§8). */
   thinkingTokens?: number;
-  raw?: Record<string, any>;
 }
 
 export interface ModelProvider {

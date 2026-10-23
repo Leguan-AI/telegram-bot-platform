@@ -1,6 +1,32 @@
+import { randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import { sql, withTenantContext, withBotContext } from './supabase';
-import { resolveProvider, CallModelResult, DocumentReadError } from './model';
+import {
+  resolveProvider,
+  CallModelResult,
+  DocumentReadError,
+  type CallModelInput,
+  type CustomToolDefinition,
+  type ModelProvider,
+} from './model';
+import {
+  ANSWER_DEADLINE_MS,
+  FINALISE_RESERVE_MS,
+  startAnswerDeadline,
+  type Deadline,
+} from './answerBudget';
+import { resolveRepoScope, type RepoScope } from './repoScope';
+import {
+  REPO_GROUNDING,
+  buildProvenanceFooter,
+  buildRepoToolDefinitions,
+  buildRepositoryDescriptors,
+  toolableRepos,
+} from './repoAnswerTools';
+import { RepoToolSession } from './repoTools';
+import type { ScopedRepoRef } from './repoToolsTypes';
+import { runToolLoop } from './toolLoop';
+import { formatToolProgress } from './toolProgress';
 import { getModelIdentifier, getContextMessageHistoryLimit, ANTHROPIC_DOCUMENT_MODEL } from './config';
 import { resolveIsolationScopeId, ISOLATION_SCOPE_TYPE } from './isolation';
 import { htmlToFormattable } from '@gramio/format/html';
@@ -204,6 +230,20 @@ export async function buildContext(
 }
 
 /**
+ * What the ledger needs from a call. Narrower than CallModelResult on purpose: a
+ * CallModelResult satisfies it, and so does one hop of a tool loop (#21 §8), so both log
+ * through the same path without this function knowing which it has.
+ */
+export interface LoggableCall {
+  model: string;
+  usage: CallModelResult['usage'];
+  requestId: string | null;
+  stopReason: string | null;
+  webSearchRequests?: number;
+  thinkingTokens?: number;
+}
+
+/**
  * Safely log a model call to the model_calls ledger.
  * Wrapped in try-catch so failures never block the user-facing answers.
  */
@@ -213,9 +253,19 @@ export async function logModelCall(input: {
   threadId: bigint | number | string | null;
   botId?: string | null;
   callType: 'answer' | 'recap' | 'push_naming' | 'document_qa';
-  result: CallModelResult;
+  result: LoggableCall;
   providerName: string;
   isolationScopeId: string;
+  /**
+   * Ties the hops of one answer together (#21 §8), so cost, cache reads and thinking can
+   * be summed per answer rather than per call.
+   */
+  answerId?: string | null;
+  hopIndex?: number | null;
+  /** Repository tool calls made in this hop, and which tools and paths they were. */
+  repoToolCalls?: number;
+  repoToolNames?: string[];
+  repoToolPaths?: string[];
 }): Promise<void> {
   try {
     const threadIdStr = input.threadId !== null && input.threadId !== undefined ? input.threadId.toString() : null;
@@ -237,7 +287,8 @@ export async function logModelCall(input: {
         insert into public.model_calls (
           entity_id, group_id, thread_id, bot_id, call_type, model, provider,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          web_search_requests, metadata
+          web_search_requests, thinking_tokens, repo_tool_calls,
+          answer_id, hop_index, metadata
         ) values (
           ${input.entityId}::uuid,
           ${input.groupId}::uuid,
@@ -251,13 +302,27 @@ export async function logModelCall(input: {
           ${input.result.usage.cache_read_tokens ?? 0},
           ${input.result.usage.cache_creation_tokens ?? 0},
           ${input.result.webSearchRequests ?? 0},
+          ${input.result.thinkingTokens ?? null},
+          ${input.repoToolCalls ?? 0},
+          ${input.answerId || null}::uuid,
+          ${input.hopIndex ?? null},
           ${tx.json({
-            ...input.result.raw,
+            // An explicit list, never a spread of the provider's response (#21 §8).
+            // `...result.raw` would put whatever a provider chose to return — including,
+            // once tools exist, the model's own text and the paths it asked for — into a
+            // column nobody audits. Nothing lands here unless it is named here.
             isolationScopeId: input.isolationScopeId,
             isolationScopeType: ISOLATION_SCOPE_TYPE,
             requestId: input.result.requestId,
             stopReason: input.result.stopReason,
             telegramThreadId: threadIdStr ? parseInt(threadIdStr, 10) : null,
+            // Tool names and the paths they touched, never file bodies (§8).
+            ...(input.repoToolNames && input.repoToolNames.length > 0
+              ? { repoToolNames: input.repoToolNames }
+              : {}),
+            ...(input.repoToolPaths && input.repoToolPaths.length > 0
+              ? { repoToolPaths: input.repoToolPaths }
+              : {}),
           })}
         )
       `;
@@ -344,6 +409,19 @@ const WEB_SEARCH_GROUNDING = `WEB SEARCH GUIDANCE:
 /**
  * Generate an answer. Internally builds the system prompt, calls the model provider, and returns answer.
  */
+/**
+ * What the user gets when the deadline arrives before any answer does. It names the cause,
+ * because "something went wrong" sends someone looking for a fault that is not there.
+ */
+const ANSWER_OUT_OF_TIME =
+  'I ran out of time working that one out. Try asking again, or narrow the question — a particular file or directory is much quicker than a whole repository.';
+
+/** A cancelled request, under either of the names a fetch abort arrives with. */
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 export async function answerQuestion(input: {
   entityId: string;
   groupId: string;
@@ -352,8 +430,22 @@ export async function answerQuestion(input: {
   model?: string | null;
   persona?: string | null;
   botId?: string | null;
+  /**
+   * Shown to the user while the answer is being worked out (#21 §7). A repository answer
+   * can spend most of its budget before a word of it exists, and a typing indicator does
+   * not say whether anything is happening. Optional: every caller still gets an answer
+   * without it.
+   */
+  onStatus?: (text: string) => Promise<void>;
+  /**
+   * When this answer must be finished, fixed by the route at the start of the request
+   * (#37 review B1). Everything that can be slow — the GitHub reads, the model hops — is
+   * measured against it rather than against its own clock.
+   */
+  deadline?: Deadline;
 }): Promise<{ text: string; entities: TelegramMessageEntity[] }> {
   const isolationScopeId = resolveIsolationScopeId(input.groupId);
+  const deadline = input.deadline ?? startAnswerDeadline();
 
   // Load the project documentation and recent transcript context
   const { contextDocs, recentConversation } = await buildContext(
@@ -361,6 +453,24 @@ export async function answerQuestion(input: {
     input.groupId,
     input.threadId
   );
+
+  // What this group and topic may read (#21 §3a, §5). The one seam that decides it; a
+  // failure here means no repository tools, never a wider scope.
+  let scope: RepoScope | null = null;
+  try {
+    scope = await resolveRepoScope({
+      entityId: input.entityId,
+      groupId: input.groupId,
+      telegramThreadId: input.threadId,
+      deadline,
+    });
+  } catch (err) {
+    console.error('Could not resolve the repository scope; answering without repository tools:', err);
+  }
+
+  const repos = scope ? toolableRepos(scope) : [];
+  const descriptors = scope ? buildRepositoryDescriptors(scope) : '';
+  const tools = buildRepoToolDefinitions(repos);
 
   const model = input.model || getModelIdentifier();
   const provider = resolveProvider(model);
@@ -376,7 +486,7 @@ ${formatRulesFor(provider.outputFormat)}
 ${CONTEXT_GROUNDING}
 
 ${WEB_SEARCH_GROUNDING}
-
+${descriptors ? `\n${tools.length > 0 ? `${REPO_GROUNDING}\n\n` : ''}REPOSITORIES:\n${descriptors}\n` : ''}
 PROJECT CONTEXT:
 ${contextDocs}`;
 
@@ -386,29 +496,172 @@ ${recentConversation}
 QUESTION:
 ${input.question}`;
 
-  const result = await provider.callModel({
+  const request = {
     systemPrompt,
     userMessage,
     model,
     cacheable: true,
     isolationScopeId,
     webSearch: { maxUses: 5 },
-  });
+  };
 
-  await logModelCall({
-    entityId: input.entityId,
-    groupId: input.groupId,
-    threadId: input.threadId,
-    botId: input.botId,
-    callType: 'answer',
-    result,
-    providerName: provider.name,
+  // No repositories to read: the single call this has always been.
+  if (tools.length === 0 || !scope || scope.installationId === null) {
+    let result: CallModelResult;
+    try {
+      result = await provider.callModel({
+        ...request,
+        // Even the single call is bounded: it is the whole answer, and the route's limit
+        // is the only thing behind it otherwise.
+        signal: deadline.signal(ANSWER_DEADLINE_MS),
+      });
+    } catch (err) {
+      if (!isTimeoutError(err)) throw err;
+      // Out of time, not broken. The route's mapError would say "something went wrong",
+      // which sends someone looking for a fault that is not there.
+      console.warn('Answer cancelled at the deadline before any text existed.');
+      return renderModelOutput(ANSWER_OUT_OF_TIME, provider.outputFormat);
+    }
+
+    await logModelCall({
+      entityId: input.entityId,
+      groupId: input.groupId,
+      threadId: input.threadId,
+      botId: input.botId,
+      callType: 'answer',
+      result,
+      providerName: provider.name,
+      isolationScopeId,
+      // An answer id and hop 0 here too (#37 review S2), so summing per answer is one
+      // query over every answer rather than one shape for each path.
+      answerId: randomUUID(),
+      hopIndex: 0,
+    });
+
+    const rendered = renderModelOutput(result.text, provider.outputFormat);
+    return { text: rendered.text, entities: rendered.entities };
+  }
+
+  return answerWithRepoTools({
+    ...input,
+    deadline,
+    installationId: scope.installationId,
+    repos,
+    tools,
+    provider,
+    request,
     isolationScopeId,
   });
+}
 
-  const rendered = renderModelOutput(result.text, provider.outputFormat);
+/**
+ * The tool-loop path (#21 §5–§9). One session per answer: one downscoped token, one
+ * pinned commit per repository, one content budget — all of it discarded when this
+ * returns.
+ */
+async function answerWithRepoTools(input: {
+  entityId: string;
+  groupId: string;
+  threadId: bigint | number | string | null;
+  botId?: string | null;
+  onStatus?: (text: string) => Promise<void>;
+  deadline: Deadline;
+  installationId: number;
+  repos: ScopedRepoRef[];
+  /** Built once by the caller: the same definitions must go out on every call (§7). */
+  tools: CustomToolDefinition[];
+  provider: ModelProvider;
+  request: Omit<CallModelInput, 'conversation'>;
+  isolationScopeId: string;
+}): Promise<{ text: string; entities: TelegramMessageEntity[] }> {
+  const { provider, repos, tools } = input;
+  const answerId = randomUUID();
+  const session = new RepoToolSession({
+    installationId: input.installationId,
+    repos,
+    deadline: input.deadline,
+  });
+
+  // Which tools ran in which hop, for the per-hop ledger rows (§8). Paths only — never
+  // what the files contained.
+  const perHop = new Map<number, { names: string[]; paths: string[] }>();
+  let currentHop = 0;
+  let lastStatus: string | null = null;
+  const record = (name: string, paths: string[]) => {
+    const entry = perHop.get(currentHop) ?? { names: [], paths: [] };
+    entry.names.push(name);
+    entry.paths.push(...paths);
+    perHop.set(currentHop, entry);
+  };
+
+  const outcome = await runToolLoop({
+    provider,
+    request: input.request,
+    tools,
+    // The hops answer to the request's deadline, not to a budget of their own: the scope
+    // resolution and context build above have already spent some of it.
+    deadlineAt: input.deadline.at,
+    finaliseMs: FINALISE_RESERVE_MS,
+    runTool: async (name, args) => {
+      const before = session.getReads().length;
+      const result = await session.run(name, args);
+      // Attributed by difference, so only files that were really read are recorded.
+      const paths = session.getReads().slice(before).map((read) => `${read.repoFullName}:${read.path}`);
+      record(name, paths);
+      return result;
+    },
+    onProgress: async ({ hop, calls }) => {
+      currentHop = hop;
+      if (!input.onStatus) return;
+      const line = formatToolProgress(calls, repos);
+      // Telegram answers an edit that changes nothing with a 400, and a model repeating a
+      // call it has already made is ordinary (§7's result memory exists for it).
+      if (!line || line === lastStatus) return;
+      lastStatus = line;
+      await input.onStatus(line);
+    },
+  });
+
+  // One row per hop, sharing the answer id (§8). Together, not in sequence: the answer is
+  // already written at this point, and six round trips in a row would delay sending it.
+  await Promise.all(
+    outcome.hops.map((hop) => {
+      const tooling = perHop.get(hop.index);
+      return logModelCall({
+        entityId: input.entityId,
+        groupId: input.groupId,
+        threadId: input.threadId,
+        botId: input.botId,
+        callType: 'answer',
+        result: hop,
+        providerName: provider.name,
+        isolationScopeId: input.isolationScopeId,
+        answerId,
+        hopIndex: hop.index,
+        // What ran, not what was asked for: calls past the per-hop cap are answered with
+        // a refusal and never reach GitHub, so counting them would overstate usage.
+        repoToolCalls: tooling?.names.length ?? 0,
+        repoToolNames: tooling?.names,
+        repoToolPaths: tooling?.paths,
+      });
+    })
+  );
+
+  if (outcome.text.trim() === '') {
+    // The loop ran out of time before any text existed. Saying so beats an empty bubble.
+    console.warn(`Tool-loop answer ${answerId} produced no text (${outcome.stoppedBecause}).`);
+    return renderModelOutput(ANSWER_OUT_OF_TIME, provider.outputFormat);
+  }
+
+  const rendered = renderModelOutput(outcome.text, provider.outputFormat);
+  const footer = buildProvenanceFooter(session.getReads(), repos);
+  if (!footer) return { text: rendered.text, entities: rendered.entities };
+
+  // Appended after rendering, as plain text: the footer is ours, and running it through
+  // the markdown converter would let a path's own characters change the formatting of
+  // the answer above it.
   return {
-    text: rendered.text,
+    text: `${rendered.text}\n\n${footer}`,
     entities: rendered.entities,
   };
 }

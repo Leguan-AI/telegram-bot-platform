@@ -11,6 +11,7 @@
  * only narrow, which the repo_links trigger enforces on write.
  */
 
+import { GITHUB_CALL_TIMEOUT_MS, type Deadline } from '@/lib/answerBudget';
 import { withTenantContext } from '@/lib/supabase';
 import {
   METADATA_ONLY_PERMISSIONS,
@@ -23,6 +24,8 @@ import type { ScopedRepo } from '@/lib/reposCommand';
 export interface RepoScope {
   status: 'none' | 'pending_confirmation' | 'suspended' | 'active';
   accountLogin: string | null;
+  /** The numeric GitHub installation id, which the answer-time token is minted against. */
+  installationId: number | null;
   repos: ScopedRepo[];
   /** The topic is pinned, i.e. narrowed below what the group offers. */
   isPinned: boolean;
@@ -47,6 +50,12 @@ export async function resolveRepoScope(input: {
   entityId: string;
   groupId: string;
   telegramThreadId: bigint | number | string | null;
+  /**
+   * The answer's deadline, where the caller has one (#37 review B1). The name lookup is
+   * two GitHub calls and the listing pages, so without a bound it can eat an answer's
+   * whole allowance before the first model call.
+   */
+  deadline?: Deadline;
 }): Promise<RepoScope> {
   const threadIdStr =
     input.telegramThreadId !== null && input.telegramThreadId !== undefined
@@ -75,7 +84,14 @@ export async function resolveRepoScope(input: {
   });
 
   if (!connection) {
-    return { status: 'none', accountLogin: null, repos: [], isPinned: false, namesUnavailable: false };
+    return {
+      status: 'none',
+      accountLogin: null,
+      installationId: null,
+      repos: [],
+      isPinned: false,
+      namesUnavailable: false,
+    };
   }
 
   const status = connection.status as RepoScope['status'];
@@ -98,60 +114,92 @@ export async function resolveRepoScope(input: {
     return {
       status,
       accountLogin: connection.account_login,
+      installationId: toInstallationId(connection.installation_id),
       repos: repoIds.map((repoId) => toUnnamedRepo(repoId, isPinned)),
       isPinned,
       namesUnavailable: false,
     };
   }
 
-  const names = await lookupRepoNames(Number(connection.installation_id), repoIds);
+  const found = await lookupRepos(Number(connection.installation_id), repoIds, input.deadline);
 
   return {
     status,
     accountLogin: connection.account_login,
+    installationId: toInstallationId(connection.installation_id),
     repos: repoIds.map((repoId) => {
-      const fullName = names.get(repoId);
-      if (!fullName) return toUnnamedRepo(repoId, isPinned);
+      const repo = found.get(repoId);
+      if (!repo) return toUnnamedRepo(repoId, isPinned);
+      const fullName = repo.fullName;
       return {
         repoId,
         fullName,
         shortName: fullName.includes('/') ? fullName.slice(fullName.indexOf('/') + 1) : fullName,
         pinned: isPinned,
+        defaultBranch: repo.defaultBranch,
+        description: repo.description,
       };
     }),
     isPinned,
     // Any miss, not only a total failure: a partial lookup otherwise shows a bare #id with
     // nothing to explain it.
-    namesUnavailable: names.size < repoIds.length,
+    namesUnavailable: found.size < repoIds.length,
   };
+}
+
+/** The id is stored as text to survive bigint; a value that will not parse is no id. */
+function toInstallationId(raw: string | null): number | null {
+  const id = Number(raw);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function toUnnamedRepo(repoId: number, pinned: boolean): ScopedRepo {
   return { repoId, fullName: `#${repoId}`, shortName: `#${repoId}`, pinned };
 }
 
+interface LookedUpRepo {
+  fullName: string;
+  defaultBranch: string;
+  description: string | null;
+}
+
 /**
- * id → `owner/name`, from the installation itself. Metadata-only, so this token cannot
- * read a line of code. An empty map means GitHub did not answer; the caller degrades to
- * ids rather than pretending the repositories are not there.
+ * id → name, branch and description, from the installation itself. Metadata-only, so this
+ * token cannot read a line of code. An empty map means GitHub did not answer; the caller
+ * degrades to ids rather than pretending the repositories are not there.
  */
-async function lookupRepoNames(installationId: number, repoIds: number[]): Promise<Map<number, string>> {
-  const names = new Map<number, string>();
-  if (!canMintInstallationTokens()) return names;
+async function lookupRepos(
+  installationId: number,
+  repoIds: number[],
+  deadline?: Deadline
+): Promise<Map<number, LookedUpRepo>> {
+  const found = new Map<number, LookedUpRepo>();
+  if (!canMintInstallationTokens()) return found;
+
+  // Whichever is shorter: one call's timeout, or what is left of the answer. A timeout
+  // here degrades to ids and no tools, which is the fail-closed direction.
+  const signal = deadline?.signal(GITHUB_CALL_TIMEOUT_MS);
 
   try {
     const token = await mintInstallationToken({
       installationId,
       permissions: { ...METADATA_ONLY_PERMISSIONS },
+      signal,
     });
-    for (const repo of await listInstallationRepositories(token.token)) {
-      if (repoIds.includes(repo.id)) names.set(repo.id, repo.fullName);
+    for (const repo of await listInstallationRepositories(token.token, signal)) {
+      if (repoIds.includes(repo.id)) {
+        found.set(repo.id, {
+          fullName: repo.fullName,
+          defaultBranch: repo.defaultBranch,
+          description: repo.description,
+        });
+      }
     }
   } catch (err) {
     console.warn(`Could not read repository names for installation ${installationId}:`, err);
   }
 
-  return names;
+  return found;
 }
 
 /**

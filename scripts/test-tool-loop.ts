@@ -234,24 +234,71 @@ test('a model that keeps calling tools is stopped and asked to answer', async ()
 });
 
 test('the time budget also ends in a final, answer-only call', async () => {
-  let clock = 0;
   const { provider, seen } = scripted([
     reply({ stopReason: 'tool_use', content: [{ type: 'tool_use', id: 't', name: 'read_file', input: {} }] }),
     reply({ stopReason: 'end_turn', text: 'wrapped up', content: [{ type: 'text', text: 'wrapped up' }] }),
   ]);
 
-  // Each reading advances past the budget, so the check after the first hop's results
-  // trips it. (At 600 per reading it did not, and the loop simply finished normally —
-  // the test passed for the wrong reason until the assertion caught it.)
-  const outcome = await loop(provider, async () => ({ content: 'body' }), {
-    maxHops: 10,
-    budgetMs: 1000,
-    now: () => (clock += 1200),
-  });
+  // The clock only moves when the tools do, which is what spends a real budget. Starting
+  // at 1000 with a 10s budget and a 1s reserve, the first hop is affordable (9s of room);
+  // its tools then take 9s, leaving exactly the reserve, so no second hop is attempted.
+  let clock = 1000;
+  const outcome = await loop(
+    provider,
+    async () => {
+      clock += 9000;
+      return { content: 'body' };
+    },
+    { maxHops: 10, budgetMs: 10_000, finaliseMs: 1000, now: () => clock }
+  );
 
   assert.strictEqual(outcome.stoppedBecause, 'time_budget');
   assert.strictEqual(outcome.text, 'wrapped up');
+  assert.strictEqual(seen.length, 2, 'one hop, then the final call');
   assert.deepStrictEqual(seen[seen.length - 1].toolChoice, { type: 'none' });
+});
+
+test('a hop never borrows the final call\'s reserve', async () => {
+  // #37 review B1: the hop allowance used to be max(remaining, finaliseMs), which let a
+  // hop run on into the time set aside for the answer. With less than the reserve left,
+  // the right move is to answer now — not to start work that cannot be finished.
+  const { provider, seen } = scripted([
+    reply({
+      stopReason: 'end_turn',
+      text: 'answered from the question alone',
+      content: [{ type: 'text', text: 'answered from the question alone' }],
+    }),
+  ]);
+
+  const outcome = await loop(provider, async () => ({ content: 'never reached' }), {
+    budgetMs: 1000,
+    finaliseMs: 20_000,
+    now: () => 5000,
+  });
+
+  assert.strictEqual(outcome.stoppedBecause, 'time_budget');
+  assert.strictEqual(outcome.text, 'answered from the question alone');
+  assert.strictEqual(seen.length, 1, 'no hop was attempted');
+  assert.deepStrictEqual(seen[0].toolChoice, { type: 'none' });
+});
+
+test('an absolute deadline accounts for work done before the loop', async () => {
+  // The route fixes the instant at the start of the request, so a loop that starts late
+  // gets what is left rather than a fresh budget of its own.
+  const { provider, seen } = scripted([
+    reply({ stopReason: 'end_turn', text: 'no time to look', content: [{ type: 'text', text: 'no time to look' }] }),
+  ]);
+
+  const outcome = await loop(provider, async () => ({ content: 'never reached' }), {
+    // 30s on the clock, a deadline at 35s, and a 20s reserve: no room for a hop.
+    deadlineAt: 35_000,
+    finaliseMs: 20_000,
+    budgetMs: 90_000,
+    now: () => 30_000,
+  });
+
+  assert.strictEqual(outcome.text, 'no time to look');
+  assert.strictEqual(seen.length, 1, 'the loop did not use a budget of its own');
 });
 
 // ---------------------------------------------------------------------------
@@ -458,4 +505,90 @@ test('a failing progress callback does not cost the answer', async () => {
   });
 
   assert.strictEqual(outcome.text, 'still answered');
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation: the budget cuts a call off mid-flight, not only between hops
+// ---------------------------------------------------------------------------
+
+/** What a provider throws when its AbortSignal fires. */
+function abortError(name: 'AbortError' | 'TimeoutError'): Error {
+  const err = new Error('aborted');
+  err.name = name;
+  return err;
+}
+
+test('every call carries a deadline signal', async () => {
+  const { provider, seen } = scripted([
+    reply({ stopReason: 'end_turn', text: 'done', content: [{ type: 'text', text: 'done' }] }),
+  ]);
+  // JSON round-tripping in `scripted` drops the signal, so this reads it directly.
+  let captured: AbortSignal | undefined;
+  const wrapped = {
+    ...provider,
+    callModel: async (input: CallModelInput) => {
+      captured = input.signal;
+      return provider.callModel(input);
+    },
+  };
+
+  await loop(wrapped, async () => ({ content: 'unused' }));
+
+  assert.ok(captured instanceof AbortSignal, 'the hop was given a signal');
+  assert.strictEqual(captured!.aborted, false, 'and it had not already fired');
+  assert.strictEqual(seen.length, 1);
+});
+
+for (const name of ['AbortError', 'TimeoutError'] as const) {
+  test(`a hop cancelled with ${name} still produces an answer`, async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: 'anthropic',
+      outputFormat: 'markdown',
+      callModel: async () => {
+        calls++;
+        // The first call is cut off; the final one answers from the question alone.
+        if (calls === 1) throw abortError(name);
+        return reply({
+          stopReason: 'end_turn',
+          text: 'I ran out of time, but here is what I know',
+          content: [{ type: 'text', text: 'I ran out of time, but here is what I know' }],
+        });
+      },
+    };
+
+    const outcome = await loop(provider, async () => ({ content: 'unused' }));
+
+    assert.strictEqual(outcome.stoppedBecause, 'time_budget');
+    assert.strictEqual(outcome.text, 'I ran out of time, but here is what I know');
+    assert.strictEqual(calls, 2, 'the cancelled hop was followed by the final call');
+  });
+}
+
+test('a cancelled final call returns no text rather than throwing', async () => {
+  // The hops are still worth logging (§8), so this must not become an exception.
+  const provider: ModelProvider = {
+    name: 'anthropic',
+    outputFormat: 'markdown',
+    callModel: async () => {
+      throw abortError('TimeoutError');
+    },
+  };
+
+  const outcome = await loop(provider, async () => ({ content: 'unused' }));
+
+  assert.strictEqual(outcome.text, '');
+  assert.strictEqual(outcome.stoppedBecause, 'time_budget');
+});
+
+test('a provider failure that is not an abort still throws', async () => {
+  const provider: ModelProvider = {
+    name: 'anthropic',
+    outputFormat: 'markdown',
+    callModel: async () => {
+      throw new Error('500 from the provider');
+    },
+  };
+
+  await assert.rejects(() => loop(provider, async () => ({ content: 'unused' })), /500 from the provider/);
 });

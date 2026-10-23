@@ -29,17 +29,24 @@ const E1 = 'f5100000-0000-0000-0000-0000000000e1';
 const E2 = 'f5200000-0000-0000-0000-0000000000e2';
 const G1 = 'f5100000-0000-0000-0000-0000000000a1';
 const G2 = 'f5200000-0000-0000-0000-0000000000a2';
+// A second group inside E1: the same workspace, the same installation, a different chat.
+const G3 = 'f5100000-0000-0000-0000-0000000000a3';
 const T1 = 'f5100000-0000-0000-0000-0000000000b1';
 const T2 = 'f5100000-0000-0000-0000-0000000000b2';
+// Deliberately carries G1's Telegram thread number: thread ids are per-chat, so two
+// groups really can both have a topic 7301.
+const T3 = 'f5100000-0000-0000-0000-0000000000b3';
 
 const CHAT_1 = '9940001';
 const CHAT_2 = '9940002';
+const CHAT_3 = '9940003';
 const TG_THREAD_1 = 7301;
 const TG_THREAD_2 = 7302;
 const INSTALL_A = '9941001';
 const INSTALL_B = '9941002';
 const REPO_1 = 5554001;
 const REPO_2 = 5554002;
+const REPO_3 = 5554003;
 const REPO_UNLINKED = 5559999;
 const PINNER = 424242;
 
@@ -91,6 +98,10 @@ async function main() {
               values (${T1}, ${E1}, ${G1}, ${TG_THREAD_1}, 'Mobile')`;
     await sql`insert into public.threads (id, entity_id, group_id, telegram_thread_id, name)
               values (${T2}, ${E1}, ${G1}, ${TG_THREAD_2}, 'Backend')`;
+    await sql`insert into public.groups (id, entity_id, telegram_chat_id, display_name)
+              values (${G3}, ${E1}, ${CHAT_3}, 'Pin Group 3')`;
+    await sql`insert into public.threads (id, entity_id, group_id, telegram_thread_id, name)
+              values (${T3}, ${E1}, ${G3}, ${TG_THREAD_1}, 'Mobile')`;
 
     await sql`insert into public.github_installations (
                 entity_id, installation_id, account_id, account_login, account_type,
@@ -109,6 +120,9 @@ async function main() {
               values (${E1}, ${inst1}, null, null, ${REPO_1})`;
     await sql`insert into public.repo_links (entity_id, github_installation_id, group_id, thread_id, repo_id)
               values (${E1}, ${inst1}, ${G1}, null, ${REPO_2})`;
+    // G3's own repository, linked to that group only.
+    await sql`insert into public.repo_links (entity_id, github_installation_id, group_id, thread_id, repo_id)
+              values (${E1}, ${inst1}, ${G3}, null, ${REPO_3})`;
     // The other tenant links the same repo ids, which must never bleed across.
     await sql`insert into public.repo_links (entity_id, github_installation_id, group_id, thread_id, repo_id)
               values (${E2}, ${inst2}, ${G2}, null, ${REPO_1})`;
@@ -226,29 +240,109 @@ async function main() {
     console.log('✅ Test 5 Passed.');
 
     // =========================================================================
-    // Test 6: scope never crosses tenants, even with identical repository ids
+    // Test 6: scope never crosses groups inside one workspace
+    //
+    // The entity-level link is shared; the group-level ones are not. One installation
+    // serves both groups, so nothing in GitHub's own permissions separates them — only
+    // the group_id filter in resolveRepoScope does, which is what this pins down.
     // =========================================================================
-    console.log('Test 6: tenant isolation...');
-    const otherTenant = await resolveRepoScope({ entityId: E2, groupId: G2, telegramThreadId: null });
-    assert.deepStrictEqual(otherTenant.repos.map((r) => r.repoId), [REPO_1]);
-    assert.strictEqual(otherTenant.isPinned, false, "Test 6: E1's pin must not appear for E2");
+    console.log('Test 6: group isolation...');
+    const groupOne = await resolveRepoScope({ entityId: E1, groupId: G1, telegramThreadId: null });
+    const groupThree = await resolveRepoScope({ entityId: E1, groupId: G3, telegramThreadId: null });
 
-    // E1's group id with E2's entity id resolves to nothing, rather than to E1's links.
-    const mismatched = await resolveRepoScope({ entityId: E2, groupId: G1, telegramThreadId: TG_THREAD_1 });
-    assert.deepStrictEqual(mismatched.repos.map((r) => r.repoId), [], 'Test 6: cross-tenant lookup leaked links');
+    assert.deepStrictEqual(
+      groupOne.repos.map((r) => r.repoId).sort(),
+      [REPO_1, REPO_2],
+      'Test 6: G1 should see the entity-wide repo and its own'
+    );
+    assert.deepStrictEqual(
+      groupThree.repos.map((r) => r.repoId).sort(),
+      [REPO_1, REPO_3],
+      'Test 6: G3 should see the entity-wide repo and its own'
+    );
+    assert.ok(
+      !groupOne.repos.some((r) => r.repoId === REPO_3),
+      "Test 6: G1 must not see G3's repository"
+    );
+    assert.ok(
+      !groupThree.repos.some((r) => r.repoId === REPO_2),
+      "Test 6: G3 must not see G1's repository"
+    );
+
+    // A pin belongs to one group's topic. G3 has a topic with the *same* Telegram thread
+    // number, which must not pick up G1's pin — the thread row is matched by number, so
+    // the group filter is the only thing standing between them.
+    const threadOne = await getThreadRowId({ entityId: E1, groupId: G1, telegramThreadId: TG_THREAD_1 });
+    assert.strictEqual(threadOne, T1, 'Test 6: wrong thread row for G1');
+    assert.strictEqual(
+      await getThreadRowId({ entityId: E1, groupId: G3, telegramThreadId: TG_THREAD_1 }),
+      T3,
+      'Test 6: the same thread number in another group must resolve to that group\'s row'
+    );
+
+    await setTopicPins({
+      entityId: E1,
+      groupId: G1,
+      threadRowId: T1,
+      installationRowId: inst1,
+      repoIds: [REPO_2],
+      telegramUserId: PINNER,
+    });
+
+    const pinnedTopicOne = await resolveRepoScope({
+      entityId: E1,
+      groupId: G1,
+      telegramThreadId: TG_THREAD_1,
+    });
+    const sameNumberElsewhere = await resolveRepoScope({
+      entityId: E1,
+      groupId: G3,
+      telegramThreadId: TG_THREAD_1,
+    });
+
+    assert.deepStrictEqual(pinnedTopicOne.repos.map((r) => r.repoId), [REPO_2], 'Test 6: the pin applies in G1');
+    assert.strictEqual(sameNumberElsewhere.isPinned, false, "Test 6: G3's topic is not pinned");
+    assert.deepStrictEqual(
+      sameNumberElsewhere.repos.map((r) => r.repoId).sort(),
+      [REPO_1, REPO_3],
+      "Test 6: G1's pin must not narrow a topic in G3"
+    );
+
+    // Back to inheriting, so the tests after this one see the state they expect.
+    await setTopicPins({
+      entityId: E1,
+      groupId: G1,
+      threadRowId: T1,
+      installationRowId: inst1,
+      repoIds: [],
+      telegramUserId: PINNER,
+    });
     console.log('✅ Test 6 Passed.');
 
     // =========================================================================
-    // Test 7: an unusable connection is reported, not silently empty
+    // Test 7: scope never crosses tenants, even with identical repository ids
     // =========================================================================
-    console.log('Test 7: connection states...');
+    console.log('Test 7: tenant isolation...');
+    const otherTenant = await resolveRepoScope({ entityId: E2, groupId: G2, telegramThreadId: null });
+    assert.deepStrictEqual(otherTenant.repos.map((r) => r.repoId), [REPO_1]);
+    assert.strictEqual(otherTenant.isPinned, false, "Test 7: E1's pin must not appear for E2");
+
+    // E1's group id with E2's entity id resolves to nothing, rather than to E1's links.
+    const mismatched = await resolveRepoScope({ entityId: E2, groupId: G1, telegramThreadId: TG_THREAD_1 });
+    assert.deepStrictEqual(mismatched.repos.map((r) => r.repoId), [], 'Test 7: cross-tenant lookup leaked links');
+    console.log('✅ Test 7 Passed.');
+
+    // =========================================================================
+    // Test 8: an unusable connection is reported, not silently empty
+    // =========================================================================
+    console.log('Test 8: connection states...');
     await sql`update public.github_installations set status = 'suspended' where entity_id = ${E1}`;
     const suspended = await resolveRepoScope({ entityId: E1, groupId: G1, telegramThreadId: TG_THREAD_1 });
-    assert.strictEqual(suspended.status, 'suspended', 'Test 7: a suspended installation must be reported');
+    assert.strictEqual(suspended.status, 'suspended', 'Test 8: a suspended installation must be reported');
     assert.strictEqual(
       await getActiveInstallationRow(E1),
       null,
-      'Test 7: a suspended installation cannot take new pins'
+      'Test 8: a suspended installation cannot take new pins'
     );
 
     await sql`update public.github_installations set status = 'pending_confirmation' where entity_id = ${E1}`;
@@ -258,9 +352,9 @@ async function main() {
     await sql`update public.github_installations set status = 'active' where entity_id = ${E1}`;
     await sql`delete from public.github_installations where entity_id = ${E1}`;
     const disconnected = await resolveRepoScope({ entityId: E1, groupId: G1, telegramThreadId: TG_THREAD_1 });
-    assert.strictEqual(disconnected.status, 'none', 'Test 7: a disconnected entity must say so');
-    assert.deepStrictEqual(disconnected.repos, [], 'Test 7: links should have gone with the installation');
-    console.log('✅ Test 7 Passed.');
+    assert.strictEqual(disconnected.status, 'none', 'Test 8: a disconnected entity must say so');
+    assert.deepStrictEqual(disconnected.repos, [], 'Test 8: links should have gone with the installation');
+    console.log('✅ Test 8 Passed.');
 
     console.log('\n🎉 ALL REPO-PIN TESTS PASSED SUCCESSFULLY! 🎉');
   } catch (error) {
