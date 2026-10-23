@@ -39,8 +39,10 @@ test('the command list offers pinning, not only the section below it', () => {
   const commandLine = html.split('\n').find((line) => line.includes('<code>/repos</code>'))!;
 
   // The section further down explained pins, and a reader still came away thinking they
-  // were not offered: the command list is the part people read.
-  assert.ok(/pin|limit a topic/i.test(commandLine), commandLine);
+  // were not offered: the command list is the part people read. It carries the command
+  // itself, not just the capability — `/repo pin` is a plausible guess and wrong.
+  assert.ok(commandLine.includes('<code>/repos pin &lt;repo&gt;</code>'), commandLine);
+  assert.ok(/group admins/i.test(commandLine), 'and says who may use it');
 });
 
 test('the Repositories section covers every point §9 requires', () => {
