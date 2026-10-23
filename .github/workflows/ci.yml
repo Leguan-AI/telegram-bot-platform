@@ -33,5 +33,6 @@ jobs:
           scripts/test-github-webhook.ts
           scripts/test-push-file.ts
           scripts/test-repos-command.ts
+          scripts/test-sensitive-files.ts
           scripts/test-setup-help.ts
           scripts/test-webhook-secret.ts
