@@ -193,6 +193,23 @@ export function isNameBlocked(path: string): boolean {
  * `scikit-learn` in a requirements file are not OpenAI keys, and a long hyphenated
  * identifier is not a Slack token. The list is finite by design — high signal, low false
  * positives — and is meant to grow by addition, not by loosening.
+ *
+ * WHEN A RULE EARNS ITS PLACE. Secrets should not be in these repositories at all, and
+ * everyone who can reach the bot in a group can already reach the repository's contents
+ * (§8) — so this list is not what stands between an attacker and a credential. What it is
+ * for is narrower and still worth having: a live credential read by the bot is copied to
+ * third-party model providers and logged there, which is a leak beyond the group.
+ *
+ * That makes the bar: match **token formats**, not **shapes**. A distinctive prefix with a
+ * length and a charset — `AKIA…`, `ghp_…`, `sk-ant-…`, `xox…`, `glpat-…` — has essentially
+ * no false positives, because nothing else looks like it. Shape rules, which match the
+ * *form* of a secret rather than a token, catch documentation just as readily: this repo's
+ * own DEPLOYMENT.md and .env.example were both blocked by exactly that mistake. The two
+ * shape rules below survive only because they carry precise placeholder predicates.
+ *
+ * So: prefer a readable repository over an exhaustive matcher. A missed secret that should
+ * never have been committed is a smaller harm than a bot that cannot read the deployment
+ * guide it is being asked about.
  */
 interface ContentRule {
   name: string;
@@ -219,22 +236,42 @@ function hasNoKeyMaterial(match: RegExpMatchArray, text: string): boolean {
 }
 
 /**
- * Passwords that are obviously stand-ins: the same word as the user (`postgres:postgres`),
- * a named placeholder, an env-var name in caps, or a bracketed token. A real password that
- * happens to be the literal word "password" is missed — an acceptable trade for being able
- * to read the deployment guide.
+ * Passwords that are obviously stand-ins rather than credentials.
+ *
+ * Every test here is anchored and narrow on purpose. The first version was not, and it
+ * exempted real-looking secrets: a leading `$` or a trailing `}` anywhere made a password
+ * a "placeholder", any `my_…` prefix did too, and any run of capitals counted as an
+ * env-var name — so `$Zk9qP2wLm`, `my_R3alS3cret!` and `QWERTY9ZK2PL` all went unflagged.
+ * A loose exemption is worse than no rule: it reads as protection while quietly removing
+ * it.
+ *
+ * Known and accepted: `admin:admin@db.prod.com` is treated as a placeholder, because
+ * user-equals-password is the local-dev convention everywhere. A real password that is
+ * literally the word "password" is missed for the same reason.
  */
 function isPlaceholderCredential(match: RegExpMatchArray): boolean {
   const user = (match[4] || '').toLowerCase();
   const password = match[5] || '';
+
+  // Substitution tokens, only when FULLY bracketed: <REDIS_PASSWORD>, {{pass}}, ${DB_PASS}.
+  if (/^<[^<>]+>$/.test(password)) return true;
+  if (/^\{\{[^{}]+\}\}$/.test(password)) return true;
+  if (/^\$\{[A-Za-z0-9_]+\}$/.test(password)) return true;
+
+  // Named stand-ins, on their own.
+  if (/^(password|passwd|pass|secret|changeme|example|placeholder|x{3,}|\*+)$/i.test(password)) return true;
+
+  // your-bot-service-password, my_db_secret — a `your`/`my` prefix AND a credential word at
+  // the end. `my_R3alS3cret!` does not qualify: it ends in punctuation, not a word.
+  if (/^(your|my)[-_.].*(password|passwd|pass|secret|token|key)$/i.test(password)) return true;
+
+  // An env-var NAME, which has to look like one: capitals, and it must name a credential.
+  // BOT_SERVICE_PASSWORD qualifies; QWERTY9ZK2PL does not.
+  if (/^[A-Z][A-Z0-9_]*(PASS|PASSWORD|SECRET|TOKEN|KEY)[A-Z0-9_]*$/.test(password)) return true;
+
+  // postgres:postgres — the local-development convention.
   if (password.toLowerCase() === user) return true;
-  if (/^(your[-_.].*|my[-_.].*|password|passwd|pass|secret|changeme|example|placeholder|xxx+|\*+)$/i.test(password)) {
-    return true;
-  }
-  // BOT_SERVICE_PASSWORD, DB_PASS — an env-var name, not a value.
-  if (/^[A-Z][A-Z0-9_]{3,}$/.test(password)) return true;
-  // <password>, {{password}}, ${DB_PASS}
-  if (/^([<{$].*|.*[>}])$/.test(password)) return true;
+
   return false;
 }
 

@@ -324,6 +324,22 @@ test('a real credential still fires, in either spelling', () => {
 });
 
 // One real credential among placeholders still counts: the scan looks at every match.
+// Each of these slipped past the first version of the exemptions. A loose exemption is
+// worse than no rule: it reads as protection while quietly removing it.
+test('a real password is not excused by looking vaguely like a placeholder', () => {
+  const realButPlaceholderish = [
+    'postgres://u:my_R3alS3cret!@db.prod.com',      // a `my_` prefix is not a placeholder
+    'postgres://u:$Zk9qP2wLm@db.prod.com',          // a leading $ is not a ${TOKEN}
+    'postgres://u:Zk9qP2wLm}@db.prod.com',          // a trailing } is not a {{token}}
+    'postgres://u:QWERTY9ZK2PL@db.prod.com',        // capitals alone are not an env-var name
+    'postgres://u:password1@db.prod.com',           // not the bare word
+    'postgres://u:your_friend@db.prod.com',         // `your` without a credential word
+  ];
+  for (const connection of realButPlaceholderish) {
+    assert.strictEqual(findContentSecret(connection), 'db-connection-string', connection);
+  }
+});
+
 test('a real credential beside placeholders is still found', () => {
   const mixed = [
     '# Example: postgres://user:password@localhost/dev',
