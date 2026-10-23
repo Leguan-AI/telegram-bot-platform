@@ -292,6 +292,23 @@ test('boolean grammar and parentheses are removed', () => {
   assert.strictEqual(stripSearchQualifiers('alpha AND beta'), 'alpha beta');
 });
 
+// Consuming the spaces around an operator makes two adjacent ones overlap, so the second
+// survived: `a OR OR b` came out as `a OR b` — still enough to make our appended repo:
+// terms optional, which is the whole reason for removing them.
+test('adjacent boolean operators do not survive each other', () => {
+  assert.strictEqual(stripSearchQualifiers('a OR OR b'), 'a b');
+  assert.strictEqual(stripSearchQualifiers('foo NOT NOT x'), 'foo x');
+  assert.strictEqual(stripSearchQualifiers('a OR OR OR b'), 'a b');
+  assert.strictEqual(stripSearchQualifiers('a AND OR NOT b'), 'a b');
+});
+
+// Only whole words: a search for ORb or NOTE is an ordinary search.
+test('words that merely start with an operator are left alone', () => {
+  assert.strictEqual(stripSearchQualifiers('a ORb c'), 'a ORb c');
+  assert.strictEqual(stripSearchQualifiers('NOTE this'), 'NOTE this');
+  assert.strictEqual(stripSearchQualifiers('ANDROID build'), 'ANDROID build');
+});
+
 test('repeated qualifiers are all removed, not just the first', () => {
   assert.strictEqual(stripSearchQualifiers('repo:a repo:b hunt'), 'hunt');
   assert.strictEqual(stripSearchQualifiers('org:a user:b repo:c needle'), 'needle');

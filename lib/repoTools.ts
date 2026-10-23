@@ -635,8 +635,15 @@ const QUALIFIER_PATTERN = new RegExp(
   'gi'
 );
 
-/** Parentheses and boolean operators, which would let the model re-structure our query. */
-const BOOLEAN_GRAMMAR = /(^|\s)(AND|OR|NOT)(\s|$)|[()]/g;
+/**
+ * Parentheses and boolean operators, which would let the model re-structure our query.
+ *
+ * Lookarounds rather than consumed delimiters: matching the spaces around an operator
+ * means two adjacent ones overlap, and the second survives. `a OR OR b` came out as
+ * `a OR b` — still enough to put an OR in front of the repo: terms we append, which is
+ * the whole point of removing them. Zero-width boundaries let each match independently.
+ */
+const BOOLEAN_GRAMMAR = /(?<=^|\s)(?:AND|OR|NOT)(?=\s|$)|[()]/g;
 
 export function stripSearchQualifiers(query: string): string {
   if (typeof query !== 'string') return '';
@@ -650,7 +657,13 @@ export function stripSearchQualifiers(query: string): string {
     cleaned = next;
   }
 
-  cleaned = cleaned.replace(BOOLEAN_GRAMMAR, ' ');
+  // Looped as well as lookaround-based: belt and braces, and consistent with the
+  // qualifier pass above.
+  for (let pass = 0; pass < 4; pass++) {
+    const next = cleaned.replace(BOOLEAN_GRAMMAR, ' ');
+    if (next === cleaned) break;
+    cleaned = next;
+  }
 
   // Any stray quote left behind would unbalance the query we build.
   cleaned = cleaned.replace(/"/g, ' ');
