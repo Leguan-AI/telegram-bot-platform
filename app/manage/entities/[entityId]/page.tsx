@@ -192,6 +192,19 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
 
         await loadGithubData();
       }
+
+      // `?tab=` lets another page land on a specific tab — the GitHub connect flow sends
+      // an admin back to the one they started from. Read from the URL rather than with
+      // useSearchParams, which would need this whole component inside a Suspense boundary
+      // for one query string; everything else here already happens in this effect.
+      //
+      // Applied after the admin check, so a link can only open a tab the viewer may see.
+      const requestedTab = new URLSearchParams(window.location.search).get('tab');
+      if (requestedTab === 'settings' || requestedTab === 'team') {
+        setActiveTab(requestedTab);
+      } else if ((requestedTab === 'groups' || requestedTab === 'github') && isAdminUser) {
+        setActiveTab(requestedTab);
+      }
     } catch (err: any) {
       setEntityError(err.message || 'Failed to load entity.');
     } finally {
