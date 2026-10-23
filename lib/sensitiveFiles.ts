@@ -46,7 +46,12 @@ export function normalizeRepoPath(raw: string): NormalizedPath {
     try {
       next = decodeURIComponent(decoded);
     } catch {
-      // A malformed escape is not something to guess at.
+      // A malformed escape is not something to guess at. Note the cost: a real filename
+      // containing a stray `%`, such as `README (100%).md`, is refused and therefore
+      // invisible to the tools. That is deliberate — failing closed on anything we cannot
+      // decode is worth more than reaching an unusual filename — but it is a real gap, not
+      // an oversight. Falling back to the raw string would also be safe, since the
+      // traversal and control-character checks run on it either way.
       return { ok: false, reason: 'invalid_path' };
     }
     if (next === decoded) break;
@@ -121,7 +126,9 @@ const FILENAME_GLOBS = [
 
 /** Rule 3 — directory rules, matched as a path suffix at any depth. */
 const DIRECTORY_SUFFIXES: RegExp[] = [
-  /(^|\/)\.ssh\/[^/]+$/i,
+  // Anything under a .ssh directory, at any depth: `.ssh/keys/id_work` is as sensitive
+  // as `.ssh/id_rsa`, and the spec's `.ssh/*` is not meant to stop at direct children.
+  /(^|\/)\.ssh\/.+$/i,
   /(^|\/)\.aws\/credentials$/i,
   /(^|\/)\.kube\/config$/i,
   /(^|\/)\.docker\/config\.json$/i,
@@ -187,6 +194,28 @@ const CONTENT_RULES: Array<{ name: string; pattern: RegExp }> = [
   // Alphanumeric only, so long hyphenated identifiers do not match.
   { name: 'openai-legacy-key', pattern: /sk-[A-Za-z0-9]{32,}/ },
   { name: 'slack-token', pattern: /xox[abeoprs]-[A-Za-z0-9-]{10,}/ },
+
+  // Added beyond #21's starting list, which says to grow it as needed. These are the
+  // credentials this platform and its neighbours actually handle.
+  //
+  // A PGP block needs its own rule: the generic one above requires `KEY-----` directly
+  // after `PRIVATE`, and a PGP header reads `PRIVATE KEY BLOCK-----`, so it slipped past.
+  { name: 'pgp-private-key', pattern: /-----BEGIN PGP PRIVATE KEY BLOCK-----/ },
+  // A Telegram bot token — the credential this very repo stores in Vault.
+  { name: 'telegram-bot-token', pattern: /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/ },
+  { name: 'xai-key', pattern: /xai-[A-Za-z0-9]{40,}/ },
+  { name: 'gitlab-token', pattern: /glpat-[A-Za-z0-9_-]{20,}/ },
+  { name: 'npm-token', pattern: /npm_[A-Za-z0-9]{36}/ },
+  // A connection string carrying an inline password, which is how most database
+  // credentials actually leak into a repository.
+  {
+    name: 'db-connection-string',
+    pattern: /(postgres(ql)?|mysql|mongodb(\+srv)?|redis):\/\/[^\s:/@]+:[^\s@]+@/i,
+  },
+  // A Supabase service-role key is a JWT, which is too generic to match on its own; keying
+  // on the role name near one keeps the false-positive rate down. Bounded so the scan
+  // cannot backtrack badly.
+  { name: 'supabase-service-role', pattern: /service_role[\s\S]{0,200}?eyJ[A-Za-z0-9_-]{20,}/ },
 ];
 
 /**
