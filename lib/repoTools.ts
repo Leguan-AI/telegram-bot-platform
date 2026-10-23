@@ -33,6 +33,7 @@ import {
 } from '@/lib/sensitiveFiles';
 import {
   DEFAULT_LIMITS,
+  matchRepoName,
   type RateBucket,
   type ReadRecord,
   type RepoToolLimits,
@@ -315,18 +316,11 @@ export class RepoToolSession {
   }
 
   private resolveRepo(name?: string): RepoState | null {
-    if (!name) {
-      return this.repos.size === 1 ? [...this.repos.values()][0] : null;
-    }
-    const wanted = name.toLowerCase();
-    const direct = this.repos.get(wanted);
-    if (direct) return direct;
-    // Accept the short name too; the model sees owner/name but people type the tail. An
-    // ambiguous tail is refused rather than resolved to whichever came first.
-    const tailMatches = [...this.repos.values()].filter((repo) =>
-      repo.ref.fullName.toLowerCase().endsWith(`/${wanted}`)
-    );
-    return tailMatches.length === 1 ? tailMatches[0] : null;
+    // Accepts the short name too; the model sees owner/name but people type the tail.
+    // matchRepoName holds the rule, shared with the progress line so the repository we
+    // say we are reading is always the one we read.
+    const matched = matchRepoName(name, [...this.repos.values()].map((repo) => repo.ref.fullName));
+    return matched ? this.repos.get(matched.toLowerCase()) ?? null : null;
   }
 
   private unknownRepo(name?: string): ToolResult {

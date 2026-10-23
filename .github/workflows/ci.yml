@@ -36,4 +36,6 @@ jobs:
           scripts/test-repos-command.ts
           scripts/test-sensitive-files.ts
           scripts/test-setup-help.ts
+          scripts/test-tool-loop.ts
+          scripts/test-tool-progress.ts
           scripts/test-webhook-secret.ts

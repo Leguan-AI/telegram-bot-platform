@@ -40,12 +40,19 @@ export class AnthropicProvider implements ModelProvider {
         headers['anthropic-beta'] = 'prompt-caching-2024-07-31';
       }
 
+      // NOTE: this provider does not attach input.webSearch — only DeepSeek does, which
+      // predates the tool work. Do not assume the two behave alike.
+      //
+      // Custom tools go at the start of the cached prefix, so the set must be identical
+      // on every call of an answer or the prompt cache resets (§7).
+      const tools = input.tools && input.tools.length > 0 ? input.tools : undefined;
+
       const response = await getAnthropicInstance().messages.create(
         {
           model: input.model,
           max_tokens: getModelMaxOutputTokens(),
           system: systemContent,
-          messages: [
+          messages: input.conversation ?? [
             {
               role: 'user',
               content: input.document
@@ -67,17 +74,25 @@ export class AnthropicProvider implements ModelProvider {
             },
           ],
           metadata: { user_id: input.isolationScopeId },
+          // The SDK types tools as its own union; ours is the same JSON shape.
+          ...(tools ? { tools: tools as any } : {}),
+          ...(input.toolChoice ? { tool_choice: input.toolChoice as any } : {}),
         },
         {
           headers,
         }
       );
 
-      // Use the shared extractReplyText helper to safely extract the final answer.
+      // extractReplyText is only correct on a FINAL response; mid-loop it returns leading
+      // narration or an empty string (§7 rule 1). The loop decides which this is — here we
+      // always extract, and a loop that is continuing ignores the text and uses `content`.
       const replyText = extractReplyText(response.content);
 
       return {
         text: replyText,
+        content: response.content as any[],
+        thinkingTokens:
+          (response.usage as any)?.output_tokens_details?.thinking_tokens ?? undefined,
         usage: {
           input_tokens: response.usage.input_tokens,
           output_tokens: response.usage.output_tokens,
