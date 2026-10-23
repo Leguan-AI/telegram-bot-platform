@@ -45,9 +45,11 @@ export default async function GitHubConnectStatusPage({
   const flow = parseConnectFlow(first(params.flow));
   const sharedAll = first(params.selection) === 'all';
 
+  // Back to the GitHub tab specifically: it is where the admin pressed Connect, and where
+  // the connection they just made is visible.
   const entityId = first(params.entity);
   const dashboardHref = entityId && UUID.test(entityId)
-    ? `/manage/entities/${entityId}`
+    ? `/manage/entities/${entityId}?tab=github`
     : '/manage/dashboard';
 
   return (
