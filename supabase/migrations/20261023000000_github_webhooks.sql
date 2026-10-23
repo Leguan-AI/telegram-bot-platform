@@ -11,8 +11,8 @@
 -- happen BEFORE the installation is resolved, so this table is platform-level: it has no
 -- entity_id, and holds nothing but a delivery id and what kind of event it was.
 --
--- Rows are kept 7 days, which covers manual redelivery, and are purged by the same
--- pg_cron retention job pattern as telegram_events (see DEPLOYMENT.md A5b / A8f).
+-- Rows are kept 7 days, which covers manual redelivery. The purge is a pg_cron job the
+-- operator schedules, in the shape of the telegram_events one — see DEPLOYMENT.md A5d.
 -- -------------------------------------------------------------
 
 create table if not exists public.github_webhook_deliveries (
@@ -27,16 +27,34 @@ create index if not exists github_webhook_deliveries_created_idx
 alter table public.github_webhook_deliveries enable row level security;
 alter table public.github_webhook_deliveries force row level security;
 
--- An unconditional policy, unlike every other table here, because this one has no tenant
--- dimension to isolate on: a delivery id is not tenant data, and the row must be written
--- before we know which entity (if any) the delivery concerns. Isolation for this table is
--- the privilege grant below, not a policy predicate.
+-- Privileges FIRST, because this table's policy cannot do the isolating.
+--
+-- Supabase's platform default privileges hand `anon` and `authenticated` full DML on every
+-- new table in `public` (verified on this database: a table created without explicit
+-- revokes shows DELETE/INSERT/SELECT/UPDATE for both). Everywhere else that does not
+-- matter, because the policy predicate — `entity_id = current_setting(...)` — is false for
+-- a session with no entity context. Here the predicate has to be unconditional, since a
+-- delivery id is not tenant data and the row must be written before we know which entity
+-- the delivery concerns. With `using (true)` the predicate stops nothing, so the grants are
+-- the whole boundary: left as Supabase creates them, anyone holding the publishable key
+-- could read, insert and — worse — DELETE delivery ids, and deleting an id re-enables
+-- replay of a captured signed delivery.
+--
+-- The same revoke-then-grant shape as 20260703000000_telegram_event_archive.sql.
+revoke all on public.github_webhook_deliveries from public;
+revoke all on public.github_webhook_deliveries from anon;
+revoke all on public.github_webhook_deliveries from authenticated;
+revoke all on public.github_webhook_deliveries from bot_service;
+
+-- The route inserts, reads back the insert, and deletes on release. It never updates, and
+-- the init schema's default privileges would otherwise have granted update too.
+grant select, insert, delete on public.github_webhook_deliveries to bot_service;
+
 drop policy if exists github_webhook_delivery_access on public.github_webhook_deliveries;
 create policy github_webhook_delivery_access on public.github_webhook_deliveries
+  to bot_service
   using (true)
   with check (true);
-
-grant select, insert, delete on public.github_webhook_deliveries to bot_service;
 
 -- -------------------------------------------------------------
 -- 2. The installation bootstrap resolver
@@ -91,6 +109,33 @@ grant execute on function public.resolve_github_installation(bigint) to bot_serv
 -- The function this one replaces. Dormant since the init schema: the GitHub sync-source
 -- it bootstrapped was never enabled, and nothing in the app has ever called it.
 drop function if exists public.resolve_entity_id_by_repo(text, text);
+
+-- -------------------------------------------------------------
+-- 2b. The same hardening for the connect-flow tables
+--
+-- github_installations, repo_links and github_connect_invites are currently protected by
+-- their policy predicates alone, with Supabase's default DML grants still in place for
+-- `anon` and `authenticated`. That holds today — the predicates are false without an entity
+-- context, and the dashboard reaches these tables only through SECURITY DEFINER functions,
+-- which run as the function owner and do not consult the caller's table privileges. But it
+-- leaves a single policy typo between a browser key and tenant data, which is what the
+-- delivery table nearly demonstrated. Revoking costs nothing and removes that coupling.
+-- -------------------------------------------------------------
+
+revoke all on public.github_installations from public;
+revoke all on public.github_installations from anon;
+revoke all on public.github_installations from authenticated;
+
+revoke all on public.repo_links from public;
+revoke all on public.repo_links from anon;
+revoke all on public.repo_links from authenticated;
+
+revoke all on public.github_connect_invites from public;
+revoke all on public.github_connect_invites from anon;
+revoke all on public.github_connect_invites from authenticated;
+
+-- bot_service keeps what the earlier migrations granted it; the revokes above name only
+-- the browser-facing roles.
 
 -- -------------------------------------------------------------
 -- 3. Invariant note (see init_schema section 4, as amended by the bot-cutover migration)

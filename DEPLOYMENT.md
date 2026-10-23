@@ -217,6 +217,19 @@ The table is tiny — one short row per delivery, and the App subscribes to no e
 the two GitHub sends automatically — so it needs no batching. Skipping this step costs
 disk slowly rather than breaking anything.
 
+Verify the job exists and that nothing has outlived the window:
+
+```sql
+select jobname, schedule, active from cron.job
+where jobname = 'github-webhook-deliveries-retention';
+
+select count(*) as total,
+       count(*) filter (where created_at < now() - interval '7 days') as overdue
+from public.github_webhook_deliveries;
+```
+
+`overdue` should be 0 once the job has run.
+
 ## A6. Table privileges for `bot_service` (now handled by the migration)
 
 ✅ **No action needed here** — table privileges are granted **inside the migration** (section 5, after the `grant execute` lines): `usage` on schema, `select/insert/update/delete` on all tables, sequence usage, and `alter default privileges` for future tables. So A5 already gave `bot_service` the base privileges it needs.

@@ -83,12 +83,26 @@ export async function POST(req: NextRequest) {
 
     const installation = await resolveInstallation(installationId);
     if (!installation) {
+      // Nothing was applied, so give the id back. The App can be installed somewhere that
+      // has not finished connecting here, and an operator who redelivers that event after
+      // connecting should see it applied rather than dismissed as a duplicate.
       console.info(`GitHub webhook ${deliveryId}: installation ${installationId} is not connected here.`);
+      await releaseWebhookDelivery(deliveryId);
       return NextResponse.json({ ok: true, reason: 'unknown_installation' });
     }
 
     // Applied for every event that carries it, including ones we otherwise ignore — it is
     // how the "All repositories" warning stays true after an owner changes their mind.
+    //
+    // Note the limit: a selection change on its own tells us the shape of the grant, not
+    // which repositories left it. Narrowing from "all" to a subset is expected to arrive
+    // as an installation_repositories.removed naming them, which is what unlinks; if
+    // GitHub ever sends the selection change without it, links to no-longer-shared
+    // repositories would linger until the next removed event. They are inert if it
+    // happens — an answer-time token is downscoped per repository id and GitHub refuses
+    // anything outside the installation, and the picker's save re-checks against the live
+    // list — but reconciling against /installation/repositories on a selection change
+    // would close it properly. Worth doing if a delivery log ever shows the gap.
     if (repositorySelection && action.kind !== 'delete_installation') {
       if (await refreshRepositorySelection(installation, repositorySelection)) {
         console.info(

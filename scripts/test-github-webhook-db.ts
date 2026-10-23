@@ -35,6 +35,8 @@ const UNKNOWN_INSTALL = '9939999';
 const REPO_1 = '5553001';
 const REPO_2 = '5553002';
 
+type AllowedRow = { allowed: boolean };
+
 type Resolved = {
   entity_id: string;
   installation_row_id: string;
@@ -329,14 +331,60 @@ async function main() {
       'Test 8: the table should carry no tenant column'
     );
 
-    const tablePrivs = await sql<{ auth: boolean; anon: boolean }[]>`
-      select
-        has_table_privilege('authenticated'::name, 'public.github_webhook_deliveries'::text, 'select') as auth,
-        has_table_privilege('anon'::name, 'public.github_webhook_deliveries'::text, 'select') as anon
+    // The policy on this table is unconditional, so the grants are the whole boundary:
+    // Supabase's default privileges would otherwise let anyone with the publishable key
+    // read, insert and — worse — DELETE delivery ids, and deleting an id re-enables replay
+    // of a captured signed delivery. Every verb is checked, not just select.
+    for (const role of ['anon', 'authenticated']) {
+      for (const verb of ['select', 'insert', 'update', 'delete', 'truncate']) {
+        const granted: AllowedRow[] = await sql<AllowedRow[]>`
+          select has_table_privilege(${role}::name, 'public.github_webhook_deliveries'::text, ${verb}) as allowed
+        `;
+        assert.strictEqual(
+          granted[0].allowed,
+          false,
+          `Test 8: ${role} must not have ${verb} on github_webhook_deliveries`
+        );
+      }
+    }
+
+    // bot_service writes and releases, but never updates.
+    const botPrivs = await sql<{ verb: string; allowed: boolean }[]>`
+      select 'select' as verb, has_table_privilege('bot_service'::name, 'public.github_webhook_deliveries'::text, 'select') as allowed
+      union all select 'insert', has_table_privilege('bot_service'::name, 'public.github_webhook_deliveries'::text, 'insert')
+      union all select 'delete', has_table_privilege('bot_service'::name, 'public.github_webhook_deliveries'::text, 'delete')
+      union all select 'update', has_table_privilege('bot_service'::name, 'public.github_webhook_deliveries'::text, 'update')
     `;
-    assert.strictEqual(tablePrivs[0].auth, false, 'Test 8: authenticated should not read deliveries');
-    assert.strictEqual(tablePrivs[0].anon, false, 'Test 8: anon should not read deliveries');
+    for (const row of botPrivs) {
+      assert.strictEqual(
+        row.allowed,
+        row.verb !== 'update',
+        `Test 8: unexpected bot_service ${row.verb} privilege on github_webhook_deliveries`
+      );
+    }
     console.log('✅ Test 8 Passed.');
+
+    // =========================================================================
+    // Test 9: the connect-flow tables are not reachable by the browser roles either
+    // =========================================================================
+    console.log('Test 9: connect-table privileges...');
+    for (const table of ['github_installations', 'repo_links', 'github_connect_invites']) {
+      for (const role of ['anon', 'authenticated']) {
+        for (const verb of ['select', 'insert', 'update', 'delete']) {
+          const granted: AllowedRow[] = await sql<AllowedRow[]>`
+            select has_table_privilege(${role}::name, ${'public.' + table}::text, ${verb}) as allowed
+          `;
+          assert.strictEqual(granted[0].allowed, false, `Test 9: ${role} must not have ${verb} on ${table}`);
+        }
+      }
+    }
+    // The dashboard reaches these through SECURITY DEFINER functions, which run as the
+    // owner — so revoking the browser roles costs it nothing.
+    const botStillWorks: AllowedRow[] = await sql<AllowedRow[]>`
+      select has_table_privilege('bot_service'::name, 'public.repo_links'::text, 'select') as allowed
+    `;
+    assert.strictEqual(botStillWorks[0].allowed, true, 'Test 9: bot_service still needs repo_links');
+    console.log('✅ Test 9 Passed.');
 
     console.log('\n🎉 ALL GITHUB WEBHOOK DB TESTS PASSED SUCCESSFULLY! 🎉');
   } catch (error) {
