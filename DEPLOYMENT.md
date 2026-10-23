@@ -450,7 +450,8 @@ curl "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
     {"command":"help","description":"Show what the bot can do"},
     {"command":"context","description":"See what docs the bot answers from here"},
     {"command":"recap","description":"Summarize the last messages in this topic"},
-    {"command":"auth","description":"Link this group to a workspace"}
+    {"command":"auth","description":"Link this group to a workspace"},
+    {"command":"repos","description":"See or pin the code repos the bot uses here"}
   ]}'
 ```
 
@@ -463,6 +464,10 @@ curl "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
 > bot during manual setup, the `curl` sequence above can be run directly (sourcing the command list from
 > `lib/commands.ts`). To bulk-sync all active platform bots after a command-list change in `lib/commands.ts`,
 > run the script instead (see A8c.3 above).
+
+> **After adding a command**, re-run that sync so the `/` menu matches the code — `/repos` was added
+> with the repository-pin work and will not appear in autocomplete until you do. The command itself
+> works regardless, since the webhook parses it server-side.
 
 ## A8d. Privacy policy page + in-chat notice configuration
 

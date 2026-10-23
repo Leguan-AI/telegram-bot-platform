@@ -45,6 +45,23 @@ import {
   NOTICE_ON_JOIN,
 } from '@/lib/privacy';
 import { rejectUnlessValidTelegramSecret } from '@/lib/webhookAuth';
+import {
+  buildContextRepoLine,
+  buildRepoListing,
+  buildReposHelp,
+  buildUnknownReposReply,
+  parseReposCommand,
+  resolveRepoNames,
+  REPOS_ANONYMOUS_ADMIN,
+  REPOS_NOT_ADMIN,
+  REPOS_NOT_IN_TOPIC,
+} from '@/lib/reposCommand';
+import {
+  getActiveInstallationRow,
+  getThreadRowId,
+  resolveRepoScope,
+  setTopicPins,
+} from '@/lib/repoScope';
 
 
 const DEFAULT_RECAP = 20;
@@ -302,6 +319,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const isAuthCommand = rawText ? rawText.startsWith('/auth') : false;
     const isRecapCommand = rawText ? rawText.startsWith('/recap') : false;
     const isPushCommand = rawText ? rawText.startsWith('/push') : captionIsPush;
+    const isReposCommand = rawText ? /^\/repos(@\S+)?(\s|$)/i.test(rawText) : false;
     const isMention = botUsername ? effectiveText.includes(`@${botUsername}`) : false;
 
     let isCommand = false;
@@ -317,6 +335,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     } else if (isAuthCommand) {
       isCommand = true;
     } else if (isRecapCommand) {
+      isCommand = true;
+    } else if (isReposCommand) {
       isCommand = true;
     } else if (isPushCommand) {
       isCommand = true;
@@ -649,6 +669,191 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: true, msg: 'Help sent' });
     }
 
+    // 11b. Respond to /repos (#21 §3a, §9)
+    if (isReposCommand) {
+      const command = parseReposCommand(rawText || '');
+
+      waitUntil(
+        (async () => {
+          const reply = (body: string) =>
+            sendMessage(bot.telegram_bot_token, message.chat.id, body, {
+              threadId,
+              replyToMessageId: message.message_id,
+              parseMode: 'HTML',
+            });
+
+          try {
+            const scope = await resolveRepoScope({
+              entityId: entity.id,
+              groupId: group.id,
+              telegramThreadId: threadId,
+            });
+
+            if (command.action === 'help') {
+              await reply(buildReposHelp(command));
+              return;
+            }
+
+            if (command.action === 'view') {
+              await reply(
+                buildRepoListing({
+                  status: scope.status,
+                  repos: scope.repos,
+                  isPinned: scope.isPinned,
+                  inTopic: threadId !== null,
+                  namesUnavailable: scope.namesUnavailable,
+                })
+              );
+              return;
+            }
+
+            // Everything below changes pins, which needs a topic and a group admin.
+            if (threadId === null) {
+              await reply(REPOS_NOT_IN_TOPIC);
+              return;
+            }
+
+            // An anonymous admin posts as the group itself, so getChatMember has nobody to
+            // check. Say so rather than failing silently (§3a).
+            const callerId = message.from?.id ?? null;
+            if (callerId === null) {
+              await reply(REPOS_ANONYMOUS_ADMIN);
+              return;
+            }
+
+            let isGroupAdmin = false;
+            try {
+              const member = await getChatMember(bot.telegram_bot_token, message.chat.id, callerId);
+              const status = member?.result?.status;
+              isGroupAdmin = status === 'administrator' || status === 'creator';
+            } catch (err) {
+              console.error('Failed admin check for /repos:', err);
+            }
+
+            if (!isGroupAdmin) {
+              await reply(REPOS_NOT_ADMIN);
+              return;
+            }
+
+            if (scope.status !== 'active') {
+              await reply(
+                buildRepoListing({
+                  status: scope.status,
+                  repos: scope.repos,
+                  isPinned: scope.isPinned,
+                  inTopic: true,
+                })
+              );
+              return;
+            }
+
+            const installationRowId = await getActiveInstallationRow(entity.id);
+            if (!installationRowId) {
+              await reply(buildRepoListing({ status: 'none', repos: [], isPinned: false, inTopic: true }));
+              return;
+            }
+
+            // The topic must exist in the registry before a pin can reference it.
+            await withTenantContext(entity.id, async (tx) => {
+              await registerThread(tx, {
+                entityId: entity.id,
+                groupId: group.id,
+                telegramThreadId: threadId,
+              });
+            });
+            const threadRowId = await getThreadRowId({
+              entityId: entity.id,
+              groupId: group.id,
+              telegramThreadId: threadId,
+            });
+            if (!threadRowId) {
+              await reply('Sorry, I could not identify this topic just now. Please try again.');
+              return;
+            }
+
+            // What the group offers is what a pin may choose from: pins narrow, never add.
+            const groupScope = await resolveRepoScope({
+              entityId: entity.id,
+              groupId: group.id,
+              telegramThreadId: null,
+            });
+
+            if (command.action === 'clear') {
+              await setTopicPins({
+                entityId: entity.id,
+                groupId: group.id,
+                threadRowId,
+                installationRowId,
+                repoIds: [],
+                telegramUserId: callerId,
+              });
+              const cleared = await resolveRepoScope({
+                entityId: entity.id,
+                groupId: group.id,
+                telegramThreadId: threadId,
+              });
+              await reply(
+                'Pins cleared — this topic is back to the group\u2019s repositories.\n\n' +
+                  buildRepoListing({
+                    status: cleared.status,
+                    repos: cleared.repos,
+                    isPinned: cleared.isPinned,
+                    inTopic: true,
+                    namesUnavailable: cleared.namesUnavailable,
+                  })
+              );
+              return;
+            }
+
+            const { repos: named, unknown } = resolveRepoNames(groupScope.repos, command.names);
+            if (unknown.length > 0) {
+              await reply(buildUnknownReposReply(unknown, groupScope.repos));
+              return;
+            }
+
+            // Pins are a set: pinning adds to what is already pinned, unpinning removes.
+            const current = scope.isPinned ? scope.repos.map((r) => r.repoId) : [];
+            const next =
+              command.action === 'pin'
+                ? Array.from(new Set([...current, ...named.map((r) => r.repoId)]))
+                : current.filter((id) => !named.some((r) => r.repoId === id));
+
+            await setTopicPins({
+              entityId: entity.id,
+              groupId: group.id,
+              threadRowId,
+              installationRowId,
+              repoIds: next,
+              telegramUserId: callerId,
+            });
+
+            const updated = await resolveRepoScope({
+              entityId: entity.id,
+              groupId: group.id,
+              telegramThreadId: threadId,
+            });
+            await reply(
+              buildRepoListing({
+                status: updated.status,
+                repos: updated.repos,
+                isPinned: updated.isPinned,
+                inTopic: true,
+                namesUnavailable: updated.namesUnavailable,
+              })
+            );
+          } catch (err) {
+            console.error('Error handling /repos:', err);
+            try {
+              await reply('⚠️ <i>Sorry, I could not read the repository settings just now.</i>');
+            } catch (sendErr) {
+              console.error('Failed fallback:', sendErr);
+            }
+          }
+        })()
+      );
+      return NextResponse.json({ ok: true, msg: 'Repos handled' });
+    }
+
     // 12. Respond to /context
     if (isContextCommand) {
       waitUntil(
@@ -656,6 +861,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
           try {
             const { entityDocs, groupDocs, topicDocs } = await getContextManifest(entity.id, group.id, threadId);
             const totalDocs = entityDocs.length + groupDocs.length + topicDocs.length;
+
+            // Repositories are context too (#21 §9). Resolved separately because their
+            // names live at GitHub, not in the database.
+            const repoScope = await resolveRepoScope({
+              entityId: entity.id,
+              groupId: group.id,
+              telegramThreadId: threadId,
+            });
 
             const entityText = entityDocs.length > 0
               ? `✓ ${entityDocs.length} document${entityDocs.length === 1 ? '' : 's'}`
@@ -673,13 +886,24 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
               `<b>Entity:</b> ${entityText}`,
               `<b>Group:</b> ${groupText}`,
               `<b>Topic:</b> ${topicText}`,
+              buildContextRepoLine({
+                status: repoScope.status,
+                repos: repoScope.repos,
+                isPinned: repoScope.isPinned,
+                inTopic: threadId !== null,
+                namesUnavailable: repoScope.namesUnavailable,
+              }),
               '',
             ];
 
             if (totalDocs > 0) {
               summaryLines.push(`📎 Full text attached below ↓`);
-            } else {
+            } else if (repoScope.repos.length === 0) {
               summaryLines.push(`<i>No context is configured for this topic yet.</i>`);
+            } else {
+              // Deliberately not "I answer from the repositories above": linking decides
+              // scope, but reading the code arrives with the answer-time tools (#21 §5-§7).
+              summaryLines.push(`<i>No documents set for this topic.</i>`);
             }
 
             await sendMessage(
