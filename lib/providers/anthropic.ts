@@ -40,6 +40,9 @@ export class AnthropicProvider implements ModelProvider {
         headers['anthropic-beta'] = 'prompt-caching-2024-07-31';
       }
 
+      // NOTE: this provider does not attach input.webSearch — only DeepSeek does, which
+      // predates the tool work. Do not assume the two behave alike.
+      //
       // Custom tools go at the start of the cached prefix, so the set must be identical
       // on every call of an answer or the prompt cache resets (§7).
       const tools = input.tools && input.tools.length > 0 ? input.tools : undefined;
@@ -73,6 +76,7 @@ export class AnthropicProvider implements ModelProvider {
           metadata: { user_id: input.isolationScopeId },
           // The SDK types tools as its own union; ours is the same JSON shape.
           ...(tools ? { tools: tools as any } : {}),
+          ...(input.toolChoice ? { tool_choice: input.toolChoice as any } : {}),
         },
         {
           headers,

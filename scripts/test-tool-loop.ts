@@ -226,10 +226,14 @@ test('a model that keeps calling tools is stopped and asked to answer', async ()
   assert.strictEqual(outcome.stoppedBecause, 'hop_cap');
   assert.strictEqual(outcome.text, 'answer from what I have');
   assert.strictEqual(seen.length, 4, 'three hops, then one final call');
-  assert.strictEqual(seen[3].tools, undefined, 'the final call must carry no tools');
+  // The tools stay attached so the cached prefix does not change; tool_choice is what
+  // makes the model answer. Both providers accept the call with tools omitted too —
+  // probed — but that resets the cache on the most expensive call of the answer.
+  assert.deepStrictEqual(seen[3].tools, TOOLS, 'the final call keeps the same tool set');
+  assert.deepStrictEqual(seen[3].toolChoice, { type: 'none' }, 'and forbids another call');
 });
 
-test('the time budget also ends in a final, tool-free call', async () => {
+test('the time budget also ends in a final, answer-only call', async () => {
   let clock = 0;
   const { provider, seen } = scripted([
     reply({ stopReason: 'tool_use', content: [{ type: 'tool_use', id: 't', name: 'read_file', input: {} }] }),
@@ -247,7 +251,7 @@ test('the time budget also ends in a final, tool-free call', async () => {
 
   assert.strictEqual(outcome.stoppedBecause, 'time_budget');
   assert.strictEqual(outcome.text, 'wrapped up');
-  assert.strictEqual(seen[seen.length - 1].tools, undefined);
+  assert.deepStrictEqual(seen[seen.length - 1].toolChoice, { type: 'none' });
 });
 
 // ---------------------------------------------------------------------------
@@ -302,4 +306,156 @@ test('a stop_reason of tool_use with no tool_use block does not loop forever', a
   const outcome = await loop(provider, async () => ({ content: 'x' }));
   assert.strictEqual(outcome.text, 'odd');
   assert.strictEqual(outcome.stoppedBecause, 'final_answer');
+});
+
+// ---------------------------------------------------------------------------
+// Review follow-ups (#36)
+// ---------------------------------------------------------------------------
+
+// The contract says tools return errors rather than throwing, but nothing enforces it.
+// One exception must not cost the user the answer — and every tool_use still needs a
+// tool_result, or the next request is a 400.
+test('a tool that throws becomes an error result, not a lost answer', async () => {
+  const { provider, seen } = scripted([
+    reply({
+      stopReason: 'tool_use',
+      content: [
+        { type: 'tool_use', id: 't1', name: 'read_file', input: {} },
+        { type: 'tool_use', id: 't2', name: 'list_tree', input: {} },
+      ],
+    }),
+    reply({ stopReason: 'end_turn', text: 'answered anyway', content: [{ type: 'text', text: 'answered anyway' }] }),
+  ]);
+
+  const outcome = await loop(provider, async (name: string) => {
+    if (name === 'read_file') throw new Error('boom');
+    return { content: 'tree listing' };
+  });
+
+  assert.strictEqual(outcome.text, 'answered anyway');
+  const results = (seen[1].conversation?.[2] as any).content;
+  assert.strictEqual(results.length, 2, 'every tool_use still gets a tool_result');
+  assert.strictEqual(results[0].is_error, true);
+  assert.match(results[0].content, /tool failed/i);
+  assert.strictEqual(results[1].content, 'tree listing');
+});
+
+// The session's byte budget caps content, not the number of GitHub requests.
+test('tool calls per hop are capped, and the extras still get results', async () => {
+  const many = Array.from({ length: 5 }, (_, i) => ({
+    type: 'tool_use',
+    id: `t${i}`,
+    name: 'read_file',
+    input: { path: `f${i}.ts` },
+  }));
+  const { provider, seen } = scripted([
+    reply({ stopReason: 'tool_use', content: many }),
+    reply({ stopReason: 'end_turn', text: 'done', content: [{ type: 'text', text: 'done' }] }),
+  ]);
+
+  let ran = 0;
+  await loop(
+    provider,
+    async () => {
+      ran++;
+      return { content: 'body' };
+    },
+    { maxToolCallsPerHop: 2 }
+  );
+
+  assert.strictEqual(ran, 2, 'only the first two run');
+  const results = (seen[1].conversation?.[2] as any).content;
+  assert.strictEqual(results.length, 5, 'but all five are answered, or the next call is a 400');
+  assert.strictEqual(results[4].is_error, true);
+  assert.match(results[4].content, /Too many tool calls/);
+});
+
+// An attached document would otherwise be dropped: `conversation` replaces the branch in
+// the provider that builds the document block.
+test('an attached document survives into the first turn', async () => {
+  const { provider, seen } = scripted([
+    reply({ stopReason: 'end_turn', text: 'read it', content: [{ type: 'text', text: 'read it' }] }),
+  ]);
+
+  await runToolLoop({
+    provider,
+    request: {
+      systemPrompt: 'system',
+      userMessage: 'summarise this',
+      model: 'test-model',
+      cacheable: true,
+      isolationScopeId: 'scope',
+      document: { data: 'YmFzZTY0', mediaType: 'application/pdf' },
+    },
+    tools: TOOLS,
+    runTool: async () => ({ content: 'x' }),
+  });
+
+  const first = seen[0].conversation?.[0] as any;
+  assert.strictEqual(Array.isArray(first.content), true);
+  assert.strictEqual(first.content[0].type, 'document');
+  assert.strictEqual(first.content[0].source.data, 'YmFzZTY0');
+  assert.strictEqual(first.content[1].text, 'summarise this');
+});
+
+// A turn cut off mid-call carries truncated narration, not an answer, and its tool calls
+// cannot be answered reliably.
+test('a turn truncated mid-tool-call is finalised rather than returned', async () => {
+  const { provider, seen } = scripted([
+    reply({
+      stopReason: 'max_tokens',
+      text: 'Let me look at',
+      content: [
+        { type: 'text', text: 'Let me look at' },
+        { type: 'tool_use', id: 't1', name: 'read_file', input: {} },
+      ],
+    }),
+    reply({ stopReason: 'end_turn', text: 'a proper answer', content: [{ type: 'text', text: 'a proper answer' }] }),
+  ]);
+
+  const outcome = await loop(provider, async () => ({ content: 'x' }));
+
+  assert.strictEqual(outcome.stoppedBecause, 'truncated_turn');
+  assert.strictEqual(outcome.text, 'a proper answer');
+  // The truncated tool_use block is not echoed back: it would demand a tool_result we are
+  // deliberately not sending.
+  const echoed = (seen[1].conversation?.[1] as any).content;
+  assert.strictEqual(echoed.some((b: any) => b.type === 'tool_use'), false);
+});
+
+// 90 seconds is a long time to watch a typing indicator.
+test('progress is reported before each hop runs its tools', async () => {
+  const { provider } = scripted([
+    reply({
+      stopReason: 'tool_use',
+      content: [{ type: 'tool_use', id: 't1', name: 'read_file', input: { path: 'src/auth.ts' } }],
+    }),
+    reply({ stopReason: 'end_turn', text: 'done', content: [{ type: 'text', text: 'done' }] }),
+  ]);
+
+  const seenProgress: any[] = [];
+  await loop(provider, async () => ({ content: 'body' }), {
+    onProgress: (p: any) => {
+      seenProgress.push(p);
+    },
+  });
+
+  assert.strictEqual(seenProgress.length, 1);
+  assert.strictEqual(seenProgress[0].hop, 0);
+  assert.deepStrictEqual(seenProgress[0].calls, [{ name: 'read_file', input: { path: 'src/auth.ts' } }]);
+});
+
+test('a failing progress callback does not cost the answer', async () => {
+  const { provider } = scripted([
+    reply({ stopReason: 'tool_use', content: [{ type: 'tool_use', id: 't1', name: 'read_file', input: {} }] }),
+    reply({ stopReason: 'end_turn', text: 'still answered', content: [{ type: 'text', text: 'still answered' }] }),
+  ]);
+
+  const outcome = await loop(provider, async () => ({ content: 'body' }), {
+    onProgress: () => {
+      throw new Error('telegram edit failed');
+    },
+  });
+
+  assert.strictEqual(outcome.text, 'still answered');
 });

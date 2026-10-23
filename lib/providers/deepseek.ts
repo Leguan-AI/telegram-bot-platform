@@ -61,6 +61,10 @@ export class DeepSeekProvider implements ModelProvider {
         createParams.tools = [...(createParams.tools || []), ...input.tools];
       }
 
+      if (input.toolChoice) {
+        createParams.tool_choice = input.toolChoice;
+      }
+
       if (input.webSearch) {
         // Appended, not assigned: §7 requires web search and custom tools in the same
         // request, and assigning here would have silently dropped the custom ones.

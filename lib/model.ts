@@ -55,6 +55,13 @@ export interface CallModelInput {
    * content echoed verbatim, then the tool results.
    */
   conversation?: ConversationMessage[];
+  /**
+   * Forces the model to answer rather than call another tool. The loop's final call sends
+   * `{ type: 'none' }` while still passing the same `tools`, so the cached prefix is
+   * unchanged — dropping the tools would work (probed on both providers) but would reset
+   * the cache at the worst moment, on the call that has the most context behind it.
+   */
+  toolChoice?: { type: 'none' | 'auto' | 'any' };
 }
 
 export interface CallModelResult {

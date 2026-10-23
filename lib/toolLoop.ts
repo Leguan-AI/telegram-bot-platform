@@ -50,7 +50,7 @@ export interface ToolLoopOutcome {
   text: string;
   hops: HopRecord[];
   /** Why the loop ended, which the caller logs and may surface. */
-  stoppedBecause: 'final_answer' | 'hop_cap' | 'time_budget';
+  stoppedBecause: 'final_answer' | 'hop_cap' | 'time_budget' | 'truncated_turn';
 }
 
 export interface ToolLoopInput {
@@ -63,21 +63,32 @@ export interface ToolLoopInput {
   maxHops?: number;
   /** Wall-clock budget for the whole loop, so the route's maxDuration is never exceeded. */
   budgetMs?: number;
+  /**
+   * Most tool calls one hop may make. The session's byte budget limits how much *content*
+   * comes back, but not how many GitHub requests a model can ask for in a single turn.
+   */
+  maxToolCallsPerHop?: number;
+  /**
+   * Called before each hop's tools run, so a caller can tell the user what is happening —
+   * 90 seconds is a long time to watch a typing indicator. `input` is model-supplied: it
+   * must be normalised and escaped before it is shown to anyone.
+   */
+  onProgress?: (progress: { hop: number; calls: Array<{ name: string; input: Record<string, unknown> }> }) => void | Promise<void>;
   now?: () => number;
 }
 
 const DEFAULT_MAX_HOPS = 6;
 const DEFAULT_BUDGET_MS = 90_000;
+const DEFAULT_MAX_TOOL_CALLS_PER_HOP = 8;
 
 export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome> {
   const maxHops = input.maxHops ?? DEFAULT_MAX_HOPS;
   const budgetMs = input.budgetMs ?? DEFAULT_BUDGET_MS;
+  const maxCalls = input.maxToolCallsPerHop ?? DEFAULT_MAX_TOOL_CALLS_PER_HOP;
   const now = input.now ?? (() => Date.now());
   const startedAt = now();
 
-  const conversation: ConversationMessage[] = [
-    { role: 'user', content: input.request.userMessage },
-  ];
+  const conversation: ConversationMessage[] = [firstTurn(input.request)];
   const hops: HopRecord[] = [];
 
   for (let index = 0; index < maxHops; index++) {
@@ -102,6 +113,16 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
 
     // Rule 1: anything that is not a continuation is the answer.
     if (response.stopReason !== 'tool_use' && response.stopReason !== 'pause_turn') {
+      if (toolUses.length > 0) {
+        // The turn was cut off mid-call (max_tokens, usually), so its text is truncated
+        // narration rather than an answer, and the calls cannot be answered reliably.
+        // Ask once more for an answer from what is already there.
+        console.warn(
+          `Tool loop: stop_reason=${response.stopReason} with ${toolUses.length} tool_use block(s); finalising instead.`
+        );
+        conversation.push({ role: 'assistant', content: content.filter((b: any) => b?.type !== 'tool_use') });
+        return finalise(input, conversation, hops, 'truncated_turn');
+      }
       return { text: textOf(response), hops, stoppedBecause: 'final_answer' };
     }
 
@@ -122,10 +143,47 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
       return { text: textOf(response), hops, stoppedBecause: 'final_answer' };
     }
 
-    // Rule 3: one user message carrying every result, in block order.
+    if (input.onProgress) {
+      try {
+        await input.onProgress({
+          hop: index,
+          calls: toolUses.map((block: any) => ({
+            name: String(block.name),
+            input: (block.input || {}) as Record<string, unknown>,
+          })),
+        });
+      } catch (err) {
+        // Telling the user what is happening is a courtesy; failing at it must not cost
+        // them the answer.
+        console.warn('Tool-loop progress callback failed:', err);
+      }
+    }
+
+    // Rule 3: one user message carrying every result, in block order. EVERY tool_use must
+    // get a tool_result, including the ones past the cap — a missing result is a 400.
     const results = [];
-    for (const call of toolUses) {
-      const result = await input.runTool(String(call.name), (call.input || {}) as Record<string, unknown>);
+    for (const [position, call] of toolUses.entries()) {
+      if (position >= maxCalls) {
+        results.push({
+          type: 'tool_result',
+          tool_use_id: call.id,
+          content: `Too many tool calls in one step; I answered the first ${maxCalls}.`,
+          is_error: true,
+        });
+        continue;
+      }
+
+      let result: ToolResult;
+      try {
+        result = await input.runTool(String(call.name), (call.input || {}) as Record<string, unknown>);
+      } catch (err) {
+        // The contract says tools return errors rather than throwing, but nothing enforces
+        // it. One exception must not lose the whole answer — and every tool_use still
+        // needs its tool_result.
+        console.error(`Tool ${String(call.name)} threw:`, err);
+        result = { content: 'That tool failed. Try something else.', isError: true };
+      }
+
       results.push({
         type: 'tool_result',
         tool_use_id: call.id,
@@ -153,11 +211,15 @@ async function finalise(
   input: ToolLoopInput,
   conversation: ConversationMessage[],
   hops: HopRecord[],
-  stoppedBecause: 'hop_cap' | 'time_budget'
+  stoppedBecause: 'hop_cap' | 'time_budget' | 'truncated_turn'
 ): Promise<ToolLoopOutcome> {
   const response = await input.provider.callModel({
     ...input.request,
-    tools: undefined,
+    // The SAME tools, with tool_choice none. Both providers accept the call with `tools`
+    // omitted — probed, see scripts/probe-tool-choice-none.ts — but omitting them changes
+    // the cached prefix, and this is the call with the most context behind it.
+    tools: input.tools,
+    toolChoice: { type: 'none' },
     conversation,
   });
 
@@ -172,6 +234,26 @@ async function finalise(
   });
 
   return { text: textOf(response), hops, stoppedBecause };
+}
+
+/**
+ * The first turn, built exactly as the providers build it — including an attached
+ * document, which `conversation` would otherwise replace and silently drop.
+ */
+function firstTurn(request: Omit<CallModelInput, 'conversation'>): ConversationMessage {
+  if (!request.document) {
+    return { role: 'user', content: request.userMessage };
+  }
+  return {
+    role: 'user',
+    content: [
+      {
+        type: 'document',
+        source: { type: 'base64', media_type: request.document.mediaType, data: request.document.data },
+      },
+      { type: 'text', text: request.userMessage },
+    ],
+  };
 }
 
 /** Rule 5: the provider already extracted it; fall back to the blocks if it did not. */
