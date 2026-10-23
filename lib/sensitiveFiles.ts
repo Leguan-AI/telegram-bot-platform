@@ -9,14 +9,42 @@
  * Pure: no network, no database, no GitHub types. Everything here is a function of a path
  * or a string, which is what lets the §6 vector table be tested exactly as written.
  *
- * Two kinds of block, which behave differently on purpose:
- *   * **name-blocked** — decided from the path alone, so the answer is the same whether or
- *     not the file exists. That is what makes these files *undiscoverable*: read_file
- *     cannot be used to probe for them, and list_tree omits them entirely.
- *   * **content-blocked** — decided by reading the file. Such a file can still appear in a
- *     listing, since listing does not read contents. Reading it returns the same refusal,
- *     which does reveal that it contains something secret-shaped. #21 accepts that: the
- *     alternative is answering "it doesn't exist", which would be a lie.
+ * **Blocking is by name only**, decided from the path alone — so the answer is the same
+ * whether or not the file exists, which is what makes these files undiscoverable:
+ * read_file cannot probe for them, and list_tree omits them before anything counts.
+ *
+ * WHY THERE IS NO CONTENT SCANNING (decided 2026-10-23, after measuring).
+ *
+ * #21 §6 also specified regexes over file contents. They were built, and then dropped,
+ * because they cost far more than they bought:
+ *
+ *   * **They block documentation.** Ten of thirteen realistic placeholder credentials
+ *     tripped them — `sk-ant-your-api-key-goes-here`, `xoxb-your-token-here`,
+ *     `glpat-xxxxxxxxxxxxxxxxxxxx`, and `AKIAIOSFODNN7EXAMPLE`, which is AWS's *own*
+ *     documentation example. Placeholders are written to look like the real thing; that is
+ *     their purpose, and it is exactly what defeats a format matcher. Earlier versions of
+ *     the same idea had already blocked this repository's own DEPLOYMENT.md and
+ *     .env.example.
+ *   * **They are never complete.** Any list covers the providers someone thought of, so a
+ *     secret in an unlisted format passes anyway. The protection was partial by
+ *     construction.
+ *   * **The exemptions are their own hazard.** Two rounds of review found the placeholder
+ *     predicates excusing real-looking passwords. A loose exemption reads as protection
+ *     while removing it.
+ *
+ * What remains true without them: secrets should not be in these repositories at all;
+ * anyone who can reach the bot in a group can already reach the repository's contents
+ * (§8); GitHub's own secret scanning sits in front; and the files where credentials
+ * actually live — .env, *.pem, credentials.json, .npmrc, *.tfvars — are blocked by name,
+ * precisely and with no false positives.
+ *
+ * The residual risk is a live credential hard-coded into an ordinarily-named source file,
+ * which the bot could then read and send to a model provider. That repository is already
+ * compromised by every collaborator who can clone it; the marginal harm is small, and the
+ * cost of pretending otherwise is a bot that cannot read a deployment guide.
+ *
+ * The user-facing promise is worded to match: "files that look like secrets — .env files,
+ * private keys, credential files — are never available", which is a claim about names.
  */
 
 /** The one reply for any blocked file. Identical for "blocked" and "does not exist". */
@@ -211,167 +239,24 @@ export function isNameBlocked(path: string): boolean {
  * never have been committed is a smaller harm than a bot that cannot read the deployment
  * guide it is being asked about.
  */
-interface ContentRule {
-  name: string;
-  pattern: RegExp;
-  /**
-   * Distinguishes a real credential from an illustration of one. Documentation is full of
-   * the *shape* of secrets — `.env.example`, a deployment runbook, a README — and blocking
-   * those files helps nobody while making the bot useless for exactly the questions it
-   * should answer. A rule with this predicate fires only when at least one match is not a
-   * placeholder.
-   */
-  isPlaceholder?: (match: RegExpMatchArray, text: string) => boolean;
-}
-
-/**
- * A PEM header with no key material after it is a template, not a key. Real keys carry
- * long base64 runs — including the single-line `\n`-escaped form this platform stores in
- * an environment variable — while a placeholder reads `-----BEGIN …-----\n...\n-----END`.
- */
-function hasNoKeyMaterial(match: RegExpMatchArray, text: string): boolean {
-  const start = match.index ?? 0;
-  const window = text.slice(start, start + 800);
-  return !/[A-Za-z0-9+/=]{40,}/.test(window);
-}
-
-/**
- * Passwords that are obviously stand-ins rather than credentials.
- *
- * Every test here is anchored and narrow on purpose. The first version was not, and it
- * exempted real-looking secrets: a leading `$` or a trailing `}` anywhere made a password
- * a "placeholder", any `my_…` prefix did too, and any run of capitals counted as an
- * env-var name — so `$Zk9qP2wLm`, `my_R3alS3cret!` and `QWERTY9ZK2PL` all went unflagged.
- * A loose exemption is worse than no rule: it reads as protection while quietly removing
- * it.
- *
- * Known and accepted: `admin:admin@db.prod.com` is treated as a placeholder, because
- * user-equals-password is the local-dev convention everywhere. A real password that is
- * literally the word "password" is missed for the same reason.
- */
-function isPlaceholderCredential(match: RegExpMatchArray): boolean {
-  const user = (match[4] || '').toLowerCase();
-  const password = match[5] || '';
-
-  // Substitution tokens, only when FULLY bracketed: <REDIS_PASSWORD>, {{pass}}, ${DB_PASS}.
-  if (/^<[^<>]+>$/.test(password)) return true;
-  if (/^\{\{[^{}]+\}\}$/.test(password)) return true;
-  if (/^\$\{[A-Za-z0-9_]+\}$/.test(password)) return true;
-
-  // Named stand-ins, on their own.
-  if (/^(password|passwd|pass|secret|changeme|example|placeholder|x{3,}|\*+)$/i.test(password)) return true;
-
-  // your-bot-service-password, my_db_secret — a `your`/`my` prefix AND a credential word at
-  // the end. `my_R3alS3cret!` does not qualify: it ends in punctuation, not a word.
-  if (/^(your|my)[-_.].*(password|passwd|pass|secret|token|key)$/i.test(password)) return true;
-
-  // An env-var NAME, which has to look like one: capitals, and it must name a credential.
-  // BOT_SERVICE_PASSWORD qualifies; QWERTY9ZK2PL does not.
-  if (/^[A-Z][A-Z0-9_]*(PASS|PASSWORD|SECRET|TOKEN|KEY)[A-Z0-9_]*$/.test(password)) return true;
-
-  // postgres:postgres — the local-development convention.
-  if (password.toLowerCase() === user) return true;
-
-  return false;
-}
-
-const CONTENT_RULES: ContentRule[] = [
-  { name: 'private-key-block', pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g, isPlaceholder: hasNoKeyMaterial },
-  { name: 'gcp-service-account', pattern: /"type"\s*:\s*"service_account"/ },
-  { name: 'aws-access-key', pattern: /(AKIA|ASIA)[0-9A-Z]{16}/ },
-  { name: 'github-token', pattern: /gh[pousr]_[A-Za-z0-9]{36}/ },
-  { name: 'github-pat', pattern: /github_pat_[A-Za-z0-9_]{22,}/ },
-  { name: 'google-api-key', pattern: /AIza[0-9A-Za-z_-]{35}/ },
-  { name: 'stripe-live-key', pattern: /[sr]k_live_[A-Za-z0-9]{20,}/ },
-  { name: 'anthropic-key', pattern: /sk-ant-[A-Za-z0-9_-]{20,}/ },
-  { name: 'openai-project-key', pattern: /sk-proj-[A-Za-z0-9_-]{20,}/ },
-  // Alphanumeric only, so long hyphenated identifiers do not match.
-  { name: 'openai-legacy-key', pattern: /sk-[A-Za-z0-9]{32,}/ },
-  { name: 'slack-token', pattern: /xox[abeoprs]-[A-Za-z0-9-]{10,}/ },
-
-  // Added beyond #21's starting list, which says to grow it as needed. These are the
-  // credentials this platform and its neighbours actually handle.
-  //
-  // A PGP block needs its own rule: the generic one above requires `KEY-----` directly
-  // after `PRIVATE`, and a PGP header reads `PRIVATE KEY BLOCK-----`, so it slipped past.
-  { name: 'pgp-private-key', pattern: /-----BEGIN PGP PRIVATE KEY BLOCK-----/g, isPlaceholder: hasNoKeyMaterial },
-  // A Telegram bot token — the credential this very repo stores in Vault.
-  { name: 'telegram-bot-token', pattern: /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/ },
-  { name: 'xai-key', pattern: /xai-[A-Za-z0-9]{40,}/ },
-  { name: 'gitlab-token', pattern: /glpat-[A-Za-z0-9_-]{20,}/ },
-  { name: 'npm-token', pattern: /npm_[A-Za-z0-9]{36}/ },
-  // A connection string carrying an inline password, which is how most database
-  // credentials actually leak into a repository.
-  {
-    name: 'db-connection-string',
-    // Groups 4 and 5 are the user and the password, which isPlaceholderCredential reads.
-    pattern: /(postgres(ql)?|mysql|mongodb(\+srv)?|redis):\/\/([^\s:/@]+):([^\s@]+)@/gi,
-    isPlaceholder: isPlaceholderCredential,
-  },
-  // A Supabase service-role key is a JWT, which is too generic to match on its own; keying
-  // on the role name near one keeps the false-positive rate down. Bounded so the scan
-  // cannot backtrack badly.
-  { name: 'supabase-service-role', pattern: /service_role[\s\S]{0,200}?eyJ[A-Za-z0-9_-]{20,}/ },
-];
-
-/**
- * The name of the first content rule the text trips, or null. The name is for logs — the
- * reply to the model never says which pattern matched, or anything about the contents.
- */
-export function findContentSecret(text: string): string | null {
-  if (typeof text !== 'string' || text.length === 0) return null;
-
-  for (const rule of CONTENT_RULES) {
-    if (!rule.isPlaceholder) {
-      // `test` on a /g regex advances lastIndex, so each rule gets a fresh one.
-      if (new RegExp(rule.pattern.source, rule.pattern.flags.replace('g', '')).test(text)) {
-        return rule.name;
-      }
-      continue;
-    }
-
-    for (const match of text.matchAll(new RegExp(rule.pattern.source, ensureGlobal(rule.pattern.flags)))) {
-      if (!rule.isPlaceholder(match, text)) return rule.name;
-    }
-  }
-
-  return null;
-}
-
-function ensureGlobal(flags: string): string {
-  return flags.includes('g') ? flags : `${flags}g`;
-}
-
-/** Rule names, for tests and for documenting what the policy covers. */
-export function contentRuleNames(): string[] {
-  return CONTENT_RULES.map((rule) => rule.name);
-}
-
 export type FileVerdict =
   | { allowed: true; path: string }
   | { allowed: false; reason: 'invalid_path' }
-  | { allowed: false; reason: 'name_blocked' }
-  | { allowed: false; reason: 'content_blocked'; rule: string };
+  | { allowed: false; reason: 'name_blocked' };
 
 /**
- * The whole policy for one file, in the order §6 requires.
+ * The whole policy for one file.
  *
  * The name check runs **before** anything that could reveal existence — in the tools that
  * means before the in-memory tree is consulted, so a name-blocked path never comes back as
- * "not found". Content is checked only once a file has been read, and only if its name was
- * acceptable.
+ * "not found".
  */
-export function checkFile(rawPath: string, content?: string): FileVerdict {
+export function checkFile(rawPath: string): FileVerdict {
   const normalized = normalizeRepoPath(rawPath);
   if (!normalized.ok) return { allowed: false, reason: 'invalid_path' };
 
   if (isNameBlocked(normalized.path)) {
     return { allowed: false, reason: 'name_blocked' };
-  }
-
-  if (content !== undefined) {
-    const rule = findContentSecret(content);
-    if (rule) return { allowed: false, reason: 'content_blocked', rule };
   }
 
   return { allowed: true, path: normalized.path };

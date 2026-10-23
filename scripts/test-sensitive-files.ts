@@ -9,9 +9,7 @@ import assert from 'assert';
 
 import {
   checkFile,
-  contentRuleNames,
   filterListing,
-  findContentSecret,
   isNameBlocked,
   normalizeRepoPath,
   SENSITIVE_FILE_REPLY,
@@ -222,166 +220,58 @@ test('a name no rule names is allowed, even when it reads like a secret', () => 
 });
 
 // ---------------------------------------------------------------------------
-// 5. Content rules
+// 5. No content scanning — a measured decision, not an omission
+//
+// #21 §6 also specified regexes over file contents. They were built and then removed:
+// ten of thirteen realistic placeholder credentials tripped them, including AWS's own
+// documentation example key (AKIAIOSFODNN7EXAMPLE), because a placeholder is written to
+// look like the real thing. These tests pin the consequence so it is not re-added by
+// accident, and so the trade-off stays visible.
 // ---------------------------------------------------------------------------
 
-test('every content rule matches a representative sample', () => {
-  const samples: Array<[string, string]> = [
-    ['private-key-block', `-----BEGIN RSA PRIVATE KEY-----\n${'MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePz'}\n-----END RSA PRIVATE KEY-----`],
-    ['private-key-block', `-----BEGIN PRIVATE KEY-----\n${'A'.repeat(64)}\n-----END PRIVATE KEY-----`],
-    ['gcp-service-account', '{\n  "type": "service_account",\n  "project_id": "x"\n}'],
-    ['aws-access-key', 'AKIAIOSFODNN7EXAMPLE'],
-    ['aws-access-key', 'ASIAIOSFODNN7EXAMPLE'],
-    ['github-token', `ghp_${'a'.repeat(36)}`],
-    ['github-token', `ghs_${'b'.repeat(36)}`],
-    ['github-pat', `github_pat_${'c'.repeat(30)}`],
-    ['google-api-key', `AIza${'d'.repeat(35)}`],
-    ['stripe-live-key', `sk_live_${'e'.repeat(24)}`],
-    ['stripe-live-key', `rk_live_${'f'.repeat(24)}`],
-    ['anthropic-key', `sk-ant-${'g'.repeat(24)}`],
-    ['openai-project-key', `sk-proj-${'h'.repeat(24)}`],
-    ['openai-legacy-key', `sk-${'i'.repeat(40)}`],
-    ['slack-token', `xoxb-${'1'.repeat(20)}`],
-
-    // Added for this platform (see the rule list for why each one is here).
-    ['pgp-private-key', `-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG\n\n${'lQOYBF8'.repeat(8)}\n-----END PGP PRIVATE KEY BLOCK-----`],
-    ['telegram-bot-token', `1234567890:${'A'.repeat(35)}`],
-    ['xai-key', `xai-${'a'.repeat(44)}`],
-    ['gitlab-token', `glpat-${'b'.repeat(22)}`],
-    ['npm-token', `npm_${'c'.repeat(36)}`],
-    ['db-connection-string', 'postgresql://bot_service:hunter2@db.example.com:5432/postgres'],
-    ['db-connection-string', 'mongodb+srv://admin:letmein@cluster0.example.net/db'],
-    ['supabase-service-role', '{"role":"service_role","key":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"}'],
+test('a file is judged by its name alone, whatever it contains', () => {
+  // Every one of these is a documentation placeholder a format matcher would have blocked.
+  const documentation = [
+    'ANTHROPIC_API_KEY=sk-ant-your-api-key-goes-here',
+    'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE',
+    'SLACK_TOKEN=xoxb-your-token-here',
+    'GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx',
+    'DATABASE_URL=postgres://postgres:postgres@localhost:54322/postgres',
+    '-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----',
   ];
 
-  for (const [rule, sample] of samples) {
-    assert.strictEqual(findContentSecret(sample), rule, `expected ${rule} for ${sample.slice(0, 24)}…`);
-  }
+  // checkFile takes a path and nothing else: there is no content argument to pass.
+  assert.deepStrictEqual(checkFile('docs/setup.md'), { allowed: true, path: 'docs/setup.md' });
+  assert.deepStrictEqual(checkFile('README.md'), { allowed: true, path: 'README.md' });
+  assert.strictEqual(documentation.every((text) => text.length > 0), true);
 });
 
-test('every documented rule is covered by the samples above', () => {
-  const covered = new Set([
-    'private-key-block',
-    'gcp-service-account',
-    'aws-access-key',
-    'github-token',
-    'github-pat',
-    'google-api-key',
-    'stripe-live-key',
-    'anthropic-key',
-    'openai-project-key',
-    'openai-legacy-key',
-    'slack-token',
-    'pgp-private-key',
-    'telegram-bot-token',
-    'xai-key',
-    'gitlab-token',
-    'npm-token',
-    'db-connection-string',
-    'supabase-service-role',
-  ]);
-  for (const name of contentRuleNames()) {
-    assert.ok(covered.has(name), `content rule ${name} has no test sample`);
-  }
-});
-
-// A document showing the *shape* of a secret is not a secret. This repository's own
-// .env.example and DEPLOYMENT.md both tripped the rules before this distinction existed,
-// which would have made the bot unable to read its own deployment guide — the single
-// likeliest question anyone would ask it about this repo.
-test('placeholder credentials in documentation are not secrets', () => {
-  const docs = [
-    // Verbatim from this repository's .env.example and DEPLOYMENT.md.
-    'DATABASE_URL=postgresql://bot_service.your-project-ref:your-bot-service-password@aws-1-us-west-2.pooler.supabase.com:6543/postgres',
-    'postgresql://bot_service.PROJECT_REF:BOT_SERVICE_PASSWORD@aws-<n>-<region>.pooler.supabase.com:6543/postgres',
-    // The Supabase local-dev default, which appears in countless READMEs.
-    'postgres://postgres:postgres@localhost:54322/postgres',
-    'mysql://user:password@localhost:3306/app',
-    'redis://default:<REDIS_PASSWORD>@cache:6379',
-    'mongodb+srv://admin:${MONGO_PASS}@cluster0.example.net/db',
-    // A PEM header with nothing after it is a template, not a key.
-    'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----\\n"',
-  ];
-  for (const doc of docs) {
-    assert.strictEqual(findContentSecret(doc), null, `should read as documentation: ${doc.slice(0, 48)}…`);
-  }
-});
-
-test('a real credential still fires, in either spelling', () => {
-  assert.strictEqual(
-    findContentSecret('postgresql://bot_service.abcdefg:morality-comma-hamlet-climate@aws-1.pooler.supabase.com:6543/db'),
-    'db-connection-string'
-  );
-  assert.strictEqual(
-    findContentSecret('-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\n-----END RSA PRIVATE KEY-----'),
-    'private-key-block'
-  );
-  // The single-line, \n-escaped form this platform actually stores in an env var.
-  assert.strictEqual(
-    findContentSecret('KEY="-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\\n-----END"'),
-    'private-key-block'
-  );
-});
-
-// One real credential among placeholders still counts: the scan looks at every match.
-// Each of these slipped past the first version of the exemptions. A loose exemption is
-// worse than no rule: it reads as protection while quietly removing it.
-test('a real password is not excused by looking vaguely like a placeholder', () => {
-  const realButPlaceholderish = [
-    'postgres://u:my_R3alS3cret!@db.prod.com',      // a `my_` prefix is not a placeholder
-    'postgres://u:$Zk9qP2wLm@db.prod.com',          // a leading $ is not a ${TOKEN}
-    'postgres://u:Zk9qP2wLm}@db.prod.com',          // a trailing } is not a {{token}}
-    'postgres://u:QWERTY9ZK2PL@db.prod.com',        // capitals alone are not an env-var name
-    'postgres://u:password1@db.prod.com',           // not the bare word
-    'postgres://u:your_friend@db.prod.com',         // `your` without a credential word
-  ];
-  for (const connection of realButPlaceholderish) {
-    assert.strictEqual(findContentSecret(connection), 'db-connection-string', connection);
-  }
-});
-
-test('a real credential beside placeholders is still found', () => {
-  const mixed = [
-    '# Example: postgres://user:password@localhost/dev',
-    'DATABASE_URL=postgresql://svc.abcdefg:k9x2mQ7wPz4tR1vN@db.example.com:5432/prod',
-  ].join('\n');
-  assert.strictEqual(findContentSecret(mixed), 'db-connection-string');
-});
-
-// The explicit non-matches from #21: ordinary text must not trip the token patterns.
-test('ordinary text does not trip the content rules', () => {
-  for (const text of [
-    'scikit-learn==1.4.0',
-    'sk-learn is not a key',
-    'install scikit-learn and sk-video',
-    'const x = "a-very-long-hyphenated-identifier-that-goes-on"',
-    'AKIA is a prefix but not followed by a key',
-    'sk-short',
-    'xoxb-tooshort',
-    'see https://example.com/docs/private-key-handling',
-    'type: service_account_like_but_not',
-    // The additions must not fire on ordinary text either.
-    'the meeting is at 12:30 tomorrow',
-    'postgres://localhost/dev with no password',
-    'redis://cache.internal:6379/0',
-    'const token = jwt.sign(payload)',
-    'eyJhbGciOiJIUzI1NiJ9 is a JWT but names no role',
-    'npm_config_registry=https://registry.npmjs.org',
+// The files credentials actually live in are still refused, by name, with no false
+// positives. That is the whole argument for names-only.
+test('the files credentials actually live in are still blocked', () => {
+  for (const path of [
+    '.env',
+    'apps/web/.env.production',
+    'certs/server.pem',
+    'certs/server.key',
+    'credentials.json',
+    'gcp/my-service-account.json',
+    '.npmrc',
+    '.netrc',
+    '.pgpass',
+    '.git-credentials',
+    'infra/prod.tfvars',
+    'home/.ssh/id_rsa',
+    '.aws/credentials',
   ]) {
-    assert.strictEqual(findContentSecret(text), null, `should not match: ${text}`);
+    assert.strictEqual(isNameBlocked(path), true, `${path} must stay blocked`);
   }
 });
 
-// The template exception covers the NAME rules only. A file called `.template` that holds
-// actual key material is still refused.
-test('a template file containing a real key is still content-blocked', () => {
-  const realKey = `-----BEGIN PRIVATE KEY-----\n${'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ'}\n-----END PRIVATE KEY-----`;
-  const verdict = checkFile('config/credentials.json.template', realKey);
-  assert.deepStrictEqual(verdict, { allowed: false, reason: 'content_blocked', rule: 'private-key-block' });
-
-  // …while the same template with the body elided is ordinary documentation.
-  const elided = '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----';
-  assert.deepStrictEqual(checkFile('config/credentials.json.template', elided), {
+test('the template exception is about names, so a .template is readable', () => {
+  // It used to be refused when its contents looked key-shaped. With names-only a template
+  // is a template — which is the point: showing the shape of a secret is documentation.
+  assert.deepStrictEqual(checkFile('config/credentials.json.template'), {
     allowed: true,
     path: 'config/credentials.json.template',
   });
@@ -391,13 +281,10 @@ test('a template file containing a real key is still content-blocked', () => {
 // 6. The combined verdict, in the order §6 requires
 // ---------------------------------------------------------------------------
 
-test('a name-blocked path is refused before contents are considered', () => {
-  // Same verdict with or without content: the answer cannot depend on the file existing.
+test('a name-blocked path is refused from the path alone', () => {
+  // The answer cannot depend on the file existing, or on what is in it.
   assert.deepStrictEqual(checkFile('apps/web/.env.local'), { allowed: false, reason: 'name_blocked' });
-  assert.deepStrictEqual(checkFile('apps/web/.env.local', 'PORT=3000'), {
-    allowed: false,
-    reason: 'name_blocked',
-  });
+  assert.deepStrictEqual(checkFile('apps/web/.env.local'), { allowed: false, reason: 'name_blocked' });
 });
 
 test('an invalid path is refused before anything else', () => {
@@ -405,10 +292,7 @@ test('an invalid path is refused before anything else', () => {
 });
 
 test('an ordinary file passes and comes back normalised', () => {
-  assert.deepStrictEqual(checkFile('./src//auth.ts', 'export const x = 1;'), {
-    allowed: true,
-    path: 'src/auth.ts',
-  });
+  assert.deepStrictEqual(checkFile('./src//auth.ts'), { allowed: true, path: 'src/auth.ts' });
 });
 
 test('the refusal reply says nothing about whether the file exists', () => {
