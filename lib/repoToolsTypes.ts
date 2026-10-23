@@ -61,3 +61,26 @@ export const DEFAULT_LIMITS: RepoToolLimits = {
  * contacting GitHub, so a retrying model cannot burn the installation's quota.
  */
 export type RateBucket = 'search' | 'rest';
+
+/**
+ * Matches a model-supplied repository name against the names in scope, returning the
+ * canonical `owner/name` or null.
+ *
+ * Shared so that the progress line the user sees and the repository actually read can
+ * never disagree: two copies of this rule drifting apart would mean telling someone we
+ * read one repository while reading another. Absent name resolves only when the scope
+ * leaves no choice, and an ambiguous tail is refused rather than resolved to whichever
+ * came first.
+ */
+export function matchRepoName(name: string | undefined, fullNames: string[]): string | null {
+  if (!name) {
+    return fullNames.length === 1 ? fullNames[0] : null;
+  }
+
+  const wanted = name.toLowerCase();
+  const direct = fullNames.find((full) => full.toLowerCase() === wanted);
+  if (direct) return direct;
+
+  const tailMatches = fullNames.filter((full) => full.toLowerCase().endsWith(`/${wanted}`));
+  return tailMatches.length === 1 ? tailMatches[0] : null;
+}
