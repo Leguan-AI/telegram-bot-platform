@@ -160,6 +160,8 @@ test('ordinary files are not caught', () => {
 test('directory rules match as a suffix at any depth', () => {
   assert.strictEqual(isNameBlocked('.ssh/config'), true);
   assert.strictEqual(isNameBlocked('home/user/.ssh/known_hosts'), true);
+  // Nested, which the literal `.ssh/*` would have missed.
+  assert.strictEqual(isNameBlocked('.ssh/keys/work/id'), true);
   assert.strictEqual(isNameBlocked('.aws/credentials'), true);
   assert.strictEqual(isNameBlocked('home/.aws/credentials'), true);
   assert.strictEqual(isNameBlocked('.kube/config'), true);
@@ -213,6 +215,16 @@ test('every content rule matches a representative sample', () => {
     ['openai-project-key', `sk-proj-${'h'.repeat(24)}`],
     ['openai-legacy-key', `sk-${'i'.repeat(40)}`],
     ['slack-token', `xoxb-${'1'.repeat(20)}`],
+
+    // Added for this platform (see the rule list for why each one is here).
+    ['pgp-private-key', '-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG'],
+    ['telegram-bot-token', `1234567890:${'A'.repeat(35)}`],
+    ['xai-key', `xai-${'a'.repeat(44)}`],
+    ['gitlab-token', `glpat-${'b'.repeat(22)}`],
+    ['npm-token', `npm_${'c'.repeat(36)}`],
+    ['db-connection-string', 'postgresql://bot_service:hunter2@db.example.com:5432/postgres'],
+    ['db-connection-string', 'mongodb+srv://admin:letmein@cluster0.example.net/db'],
+    ['supabase-service-role', '{"role":"service_role","key":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"}'],
   ];
 
   for (const [rule, sample] of samples) {
@@ -233,6 +245,13 @@ test('every documented rule is covered by the samples above', () => {
     'openai-project-key',
     'openai-legacy-key',
     'slack-token',
+    'pgp-private-key',
+    'telegram-bot-token',
+    'xai-key',
+    'gitlab-token',
+    'npm-token',
+    'db-connection-string',
+    'supabase-service-role',
   ]);
   for (const name of contentRuleNames()) {
     assert.ok(covered.has(name), `content rule ${name} has no test sample`);
@@ -251,6 +270,13 @@ test('ordinary text does not trip the content rules', () => {
     'xoxb-tooshort',
     'see https://example.com/docs/private-key-handling',
     'type: service_account_like_but_not',
+    // The additions must not fire on ordinary text either.
+    'the meeting is at 12:30 tomorrow',
+    'postgres://localhost/dev with no password',
+    'redis://cache.internal:6379/0',
+    'const token = jwt.sign(payload)',
+    'eyJhbGciOiJIUzI1NiJ9 is a JWT but names no role',
+    'npm_config_registry=https://registry.npmjs.org',
   ]) {
     assert.strictEqual(findContentSecret(text), null, `should not match: ${text}`);
   }
