@@ -140,10 +140,129 @@ test('name-blocked entries are removed before counting and capping', async () =>
   assert.match(result.content, /…1 more entries/, 'the marker counts only visible entries');
 });
 
-test('a truncated tree says so', async () => {
-  stub([tokenRoute, shaRoute, treeRoute([blob('a.ts')], true)]);
+// ---------------------------------------------------------------------------
+// Truncated trees (§6): GitHub gives up at ~100,000 entries, and what we hold is
+// then an arbitrary prefix of the repository rather than a smaller tree.
+// ---------------------------------------------------------------------------
+
+/** A contents-API directory listing, which is what the fallback asks for. */
+function dirRoute(path: string, entries: unknown[]): Route {
+  return { match: path ? `/contents/${path}` : '/contents?', body: entries };
+}
+
+const dirEntry = (name: string, path = name) => ({ name, path, type: 'dir' });
+const fileEntry = (name: string, path = name, size = 12) => ({ name, path, type: 'file', size });
+
+test('a truncated tree is answered by listing the directory directly', async () => {
+  // The held tree says the repository contains one file. The truth, from the directory
+  // itself, is three entries — which is the whole point: filtering a truncated tree
+  // would report "no entries" for directories that are full.
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    dirRoute('', [fileEntry('README.md'), dirEntry('src'), fileEntry('a.ts')]),
+  ]);
+
   const result = await session().listTree({});
-  assert.match(result.content, /truncated/i);
+
+  assert.match(result.content, /README\.md/);
+  assert.match(result.content, /dir\s+src\//);
+  assert.match(result.content, /listed the repository root directly/i, result.content);
+  assert.ok(calls.some((c) => c.url.includes('/contents?ref=deadbeef')), calls.map((c) => c.url).join('\n'));
+});
+
+test('the fallback lists the directory that was asked for, at the pinned commit', async () => {
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    dirRoute('src', [fileEntry('auth.ts', 'src/auth.ts'), dirEntry('lib', 'src/lib')]),
+  ]);
+
+  const result = await session().listTree({ path: 'src' });
+
+  // Names are relative to the directory asked for, as in an ordinary listing.
+  assert.match(result.content, /file\s+auth\.ts/);
+  assert.match(result.content, /dir\s+lib\//);
+  assert.ok(
+    calls.some((c) => c.url.includes('/contents/src?ref=deadbeef')),
+    calls.map((c) => c.url).join('\n')
+  );
+});
+
+test('the fallback still removes name-blocked entries before counting them', async () => {
+  // §6 rule 6 holds on this path too: the fallback must not become a way to learn that a
+  // blocked file exists.
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    dirRoute('', [fileEntry('.env'), fileEntry('id_rsa'), fileEntry('README.md')]),
+  ]);
+
+  const result = await session().listTree({});
+
+  assert.ok(!result.content.includes('.env'), result.content);
+  assert.ok(!result.content.includes('id_rsa'), result.content);
+  assert.match(result.content, /README\.md/);
+  assert.ok(!/more entries/.test(result.content), 'a blocked entry must not even be counted');
+});
+
+test('a deeper request says it only went one level', async () => {
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    dirRoute('', [dirEntry('src')]),
+  ]);
+
+  const result = await session().listTree({ depth: 3 });
+  assert.match(result.content, /one level only/i, result.content);
+  assert.match(result.content, /Ask for a subdirectory/i);
+});
+
+test('a directory that is not there is reported as empty, not as a failure', async () => {
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    { match: '/contents/nope', status: 404, body: { message: 'Not Found' } },
+  ]);
+
+  const result = await session().listTree({ path: 'nope' });
+  assert.strictEqual(result.content, 'No entries under nope.');
+  assert.ok(!result.isError, 'a missing directory is an answer, not an error');
+});
+
+test('a path that turns out to be a file says so', async () => {
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    { match: '/contents/a.ts', body: { type: 'file', path: 'a.ts', size: 10 } },
+  ]);
+
+  const result = await session().listTree({ path: 'a.ts' });
+  assert.match(result.content, /is a file\. Use read_file/);
+});
+
+test('a repeated listing of a truncated repository makes no second request', async () => {
+  stub([
+    tokenRoute,
+    shaRoute,
+    treeRoute([blob('a.ts')], true),
+    dirRoute('', [fileEntry('README.md')]),
+  ]);
+
+  const live = session();
+  const first = await live.listTree({});
+  const before = calls.length;
+  const second = await live.listTree({});
+
+  assert.strictEqual(calls.length, before, 'the result memory covers the fallback too');
+  assert.match(second.content, /already/i, 'a repeat of content returns the pointer (§7 rule 6)');
+  assert.notStrictEqual(first.content, second.content);
 });
 
 // ---------------------------------------------------------------------------
