@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { buildInstallUrl, isGitHubAppConfigured } from '@/lib/githubApp';
-import { isConnectTokenShape } from '@/lib/githubConnect';
+import { isConnectTokenShape } from '@/lib/connectState';
 
 /**
  * Hands a connect token off to GitHub's App install screen (#21 §2a step 1, §2b step 3).

@@ -168,7 +168,7 @@ const RESULT_COPY: Record<ConnectResultCode, ConnectResultCopy> = {
   },
   missing_code: {
     title: 'GitHub did not ask you to authorize',
-    body: 'The connection needs you to authorize as yourself so we can verify you own the account. Please start again from the link; if it keeps happening, report it.',
+    body: 'Connecting needs you to authorize as yourself, so we can verify you own the account — and GitHub did not offer that step, even after we asked for it directly. That points at the app\u2019s own settings rather than anything you did: "Request user authorization (OAuth) during installation" has to be on. Please report it; nothing was recorded.',
     tone: 'error',
   },
   missing_installation: {

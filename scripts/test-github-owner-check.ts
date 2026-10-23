@@ -6,9 +6,11 @@
 import { test, after } from 'node:test';
 import assert from 'assert';
 
+import { buildConnectState, parseConnectState } from '../lib/connectState';
 import {
   assertInstallationNotSuspended,
   assertInstallationOwner,
+  buildAuthorizeUrl,
   buildInstallUrl,
   findUserInstallation,
   revokeUserToken,
@@ -294,4 +296,45 @@ test('token revocation uses DELETE + basic auth and sends the token in the body'
 test('a failed revocation does not throw (the token expires on its own)', async () => {
   stubFetch([{ match: '/applications/', status: 500, body: {} }]);
   await revokeUserToken('user-token-xyz');
+});
+
+// ---------------------------------------------------------------------------
+// The connect `state`, and the authorization hop it marks (#21 §2)
+//
+// GitHub issues an OAuth code on the *install* leg only. An owner whose account already
+// has the App — after a disconnect, or because another workspace installed it — gets the
+// configure screen instead, which redirects back with no code. The callback then sends
+// them through the authorization endpoint once, carrying the installation id in the state
+// because that second redirect arrives without one.
+// ---------------------------------------------------------------------------
+
+test('a bare token parses as the first hop', () => {
+  const parsed = parseConnectState('ABCDEFGHJKMNPQRSTVWXYZ0123');
+  assert.deepStrictEqual(parsed, { token: 'ABCDEFGHJKMNPQRSTVWXYZ0123', installationId: null });
+});
+
+test('the second hop round-trips the token and the installation id', () => {
+  const token = 'ABCDEFGHJKMNPQRSTVWXYZ0123';
+  const state = buildConnectState(token, 4242);
+  assert.strictEqual(state, 'ABCDEFGHJKMNPQRSTVWXYZ0123~4242');
+  assert.deepStrictEqual(parseConnectState(state), { token, installationId: 4242 });
+});
+
+test('a malformed state is refused rather than half-read', () => {
+  const token = 'ABCDEFGHJKMNPQRSTVWXYZ0123';
+  assert.strictEqual(parseConnectState('short'), null);
+  assert.strictEqual(parseConnectState(`${token}~`), null);
+  assert.strictEqual(parseConnectState(`${token}~abc`), null);
+  assert.strictEqual(parseConnectState(`${token}~-1`), null);
+  assert.strictEqual(parseConnectState(`${token}~0`), null);
+  assert.strictEqual(parseConnectState(`${token}~4242~4243`), null);
+  assert.strictEqual(parseConnectState(`lowercase~4242`), null);
+});
+
+test('the authorize URL carries the client id and the encoded state', () => {
+  const url = buildAuthorizeUrl('ABCDEFGHJKMNPQRSTVWXYZ0123~4242');
+  assert.strictEqual(
+    url,
+    'https://github.com/login/oauth/authorize?client_id=Iv1.testclientid&state=ABCDEFGHJKMNPQRSTVWXYZ0123~4242'
+  );
 });
