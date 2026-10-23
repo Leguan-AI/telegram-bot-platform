@@ -194,8 +194,52 @@ export function isNameBlocked(path: string): boolean {
  * identifier is not a Slack token. The list is finite by design — high signal, low false
  * positives — and is meant to grow by addition, not by loosening.
  */
-const CONTENT_RULES: Array<{ name: string; pattern: RegExp }> = [
-  { name: 'private-key-block', pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+interface ContentRule {
+  name: string;
+  pattern: RegExp;
+  /**
+   * Distinguishes a real credential from an illustration of one. Documentation is full of
+   * the *shape* of secrets — `.env.example`, a deployment runbook, a README — and blocking
+   * those files helps nobody while making the bot useless for exactly the questions it
+   * should answer. A rule with this predicate fires only when at least one match is not a
+   * placeholder.
+   */
+  isPlaceholder?: (match: RegExpMatchArray, text: string) => boolean;
+}
+
+/**
+ * A PEM header with no key material after it is a template, not a key. Real keys carry
+ * long base64 runs — including the single-line `\n`-escaped form this platform stores in
+ * an environment variable — while a placeholder reads `-----BEGIN …-----\n...\n-----END`.
+ */
+function hasNoKeyMaterial(match: RegExpMatchArray, text: string): boolean {
+  const start = match.index ?? 0;
+  const window = text.slice(start, start + 800);
+  return !/[A-Za-z0-9+/=]{40,}/.test(window);
+}
+
+/**
+ * Passwords that are obviously stand-ins: the same word as the user (`postgres:postgres`),
+ * a named placeholder, an env-var name in caps, or a bracketed token. A real password that
+ * happens to be the literal word "password" is missed — an acceptable trade for being able
+ * to read the deployment guide.
+ */
+function isPlaceholderCredential(match: RegExpMatchArray): boolean {
+  const user = (match[4] || '').toLowerCase();
+  const password = match[5] || '';
+  if (password.toLowerCase() === user) return true;
+  if (/^(your[-_.].*|my[-_.].*|password|passwd|pass|secret|changeme|example|placeholder|xxx+|\*+)$/i.test(password)) {
+    return true;
+  }
+  // BOT_SERVICE_PASSWORD, DB_PASS — an env-var name, not a value.
+  if (/^[A-Z][A-Z0-9_]{3,}$/.test(password)) return true;
+  // <password>, {{password}}, ${DB_PASS}
+  if (/^([<{$].*|.*[>}])$/.test(password)) return true;
+  return false;
+}
+
+const CONTENT_RULES: ContentRule[] = [
+  { name: 'private-key-block', pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g, isPlaceholder: hasNoKeyMaterial },
   { name: 'gcp-service-account', pattern: /"type"\s*:\s*"service_account"/ },
   { name: 'aws-access-key', pattern: /(AKIA|ASIA)[0-9A-Z]{16}/ },
   { name: 'github-token', pattern: /gh[pousr]_[A-Za-z0-9]{36}/ },
@@ -213,7 +257,7 @@ const CONTENT_RULES: Array<{ name: string; pattern: RegExp }> = [
   //
   // A PGP block needs its own rule: the generic one above requires `KEY-----` directly
   // after `PRIVATE`, and a PGP header reads `PRIVATE KEY BLOCK-----`, so it slipped past.
-  { name: 'pgp-private-key', pattern: /-----BEGIN PGP PRIVATE KEY BLOCK-----/ },
+  { name: 'pgp-private-key', pattern: /-----BEGIN PGP PRIVATE KEY BLOCK-----/g, isPlaceholder: hasNoKeyMaterial },
   // A Telegram bot token — the credential this very repo stores in Vault.
   { name: 'telegram-bot-token', pattern: /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/ },
   { name: 'xai-key', pattern: /xai-[A-Za-z0-9]{40,}/ },
@@ -223,7 +267,9 @@ const CONTENT_RULES: Array<{ name: string; pattern: RegExp }> = [
   // credentials actually leak into a repository.
   {
     name: 'db-connection-string',
-    pattern: /(postgres(ql)?|mysql|mongodb(\+srv)?|redis):\/\/[^\s:/@]+:[^\s@]+@/i,
+    // Groups 4 and 5 are the user and the password, which isPlaceholderCredential reads.
+    pattern: /(postgres(ql)?|mysql|mongodb(\+srv)?|redis):\/\/([^\s:/@]+):([^\s@]+)@/gi,
+    isPlaceholder: isPlaceholderCredential,
   },
   // A Supabase service-role key is a JWT, which is too generic to match on its own; keying
   // on the role name near one keeps the false-positive rate down. Bounded so the scan
@@ -237,10 +283,26 @@ const CONTENT_RULES: Array<{ name: string; pattern: RegExp }> = [
  */
 export function findContentSecret(text: string): string | null {
   if (typeof text !== 'string' || text.length === 0) return null;
+
   for (const rule of CONTENT_RULES) {
-    if (rule.pattern.test(text)) return rule.name;
+    if (!rule.isPlaceholder) {
+      // `test` on a /g regex advances lastIndex, so each rule gets a fresh one.
+      if (new RegExp(rule.pattern.source, rule.pattern.flags.replace('g', '')).test(text)) {
+        return rule.name;
+      }
+      continue;
+    }
+
+    for (const match of text.matchAll(new RegExp(rule.pattern.source, ensureGlobal(rule.pattern.flags)))) {
+      if (!rule.isPlaceholder(match, text)) return rule.name;
+    }
   }
+
   return null;
+}
+
+function ensureGlobal(flags: string): string {
+  return flags.includes('g') ? flags : `${flags}g`;
 }
 
 /** Rule names, for tests and for documenting what the policy covers. */
