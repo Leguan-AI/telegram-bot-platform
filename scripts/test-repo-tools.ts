@@ -32,7 +32,7 @@ after(() => {
   globalThis.fetch = realFetch;
 });
 
-type Route = { match: string; status?: number; body: unknown };
+type Route = { match: string; status?: number; body: unknown; headers?: Record<string, string> };
 
 function stub(routes: Route[]) {
   calls = [];
@@ -44,7 +44,7 @@ function stub(routes: Route[]) {
     const status = route.status ?? 200;
     return new Response(status === 204 ? null : JSON.stringify(route.body), {
       status,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...(route.headers || {}) },
     });
   }) as typeof fetch;
 }
@@ -263,6 +263,40 @@ test('qualifiers are stripped from the model query', () => {
   assert.strictEqual(stripSearchQualifiers('plain query'), 'plain query');
 });
 
+// Each of these got through the first implementation. They are kept as a set because the
+// hole was never one spelling — it was assuming qualifiers only follow whitespace.
+test('qualifier injection cannot survive a non-whitespace boundary', () => {
+  assert.strictEqual(stripSearchQualifiers('foo (repo:evil/x OR bar)'), 'foo bar');
+  assert.strictEqual(stripSearchQualifiers('foo +repo:evil/x'), 'foo');
+  assert.strictEqual(stripSearchQualifiers('a\trepo:evil/x'), 'a');
+  assert.strictEqual(stripSearchQualifiers('thing,repo:evil/x'), 'thing,');
+});
+
+test('qualifiers the first key list missed are stripped', () => {
+  assert.strictEqual(stripSearchQualifiers('owner:evil thing'), 'thing');
+  assert.strictEqual(stripSearchQualifiers('enterprise:x thing'), 'thing');
+  assert.strictEqual(stripSearchQualifiers('symbol:main thing'), 'thing');
+  assert.strictEqual(stripSearchQualifiers('content:secret thing'), 'thing');
+});
+
+test('a quoted value is consumed whole, leaving no dangling quote', () => {
+  assert.strictEqual(stripSearchQualifiers('repo:"quoted value" rest'), 'rest');
+  assert.strictEqual(stripSearchQualifiers('path:"src/deep dir" needle'), 'needle');
+});
+
+// Scoping the model can switch off is not scoping: a surviving OR would make the repo:
+// terms we append optional.
+test('boolean grammar and parentheses are removed', () => {
+  assert.strictEqual(stripSearchQualifiers('NOT repo:x secret'), 'secret');
+  assert.strictEqual(stripSearchQualifiers('(alpha OR beta)'), 'alpha beta');
+  assert.strictEqual(stripSearchQualifiers('alpha AND beta'), 'alpha beta');
+});
+
+test('repeated qualifiers are all removed, not just the first', () => {
+  assert.strictEqual(stripSearchQualifiers('repo:a repo:b hunt'), 'hunt');
+  assert.strictEqual(stripSearchQualifiers('org:a user:b repo:c needle'), 'needle');
+});
+
 test('the search is re-scoped to our own repositories', async () => {
   stub([tokenRoute, { match: '/search/code', body: { items: [] } }]);
   await session().searchCode({ query: 'org:evil password' });
@@ -271,6 +305,67 @@ test('the search is re-scoped to our own repositories', async () => {
   const q = decodeURIComponent(new URL(search!.url).searchParams.get('q') || '');
   assert.strictEqual(q, 'password repo:acme/api');
   assert.ok(!q.includes('org:evil'), 'the injected qualifier must be gone');
+});
+
+// Fails closed: a hit we cannot attribute to an in-scope repository is dropped. An
+// installation token can search public code anywhere, so "no repository field" is exactly
+// the shape a leak would take.
+test('a hit with no identifiable repository is dropped', async () => {
+  stub([
+    tokenRoute,
+    {
+      match: '/search/code',
+      body: {
+        items: [
+          { path: 'src/a.ts', repository: { id: 1 }, text_matches: [{ fragment: 'ok' }] },
+          { path: 'elsewhere/x.ts', text_matches: [{ fragment: 'leak' }] },
+          { path: 'elsewhere/y.ts', repository: {}, text_matches: [{ fragment: 'leak' }] },
+        ],
+      },
+    },
+  ]);
+  const result = await session().searchCode({ query: 'thing' });
+  assert.ok(!result.content.includes('elsewhere'), 'unattributable hits must be dropped');
+  assert.match(result.content, /^1 match/);
+});
+
+test('search output and listings count against the answer budget', async () => {
+  stub([tokenRoute, shaRoute, treeRoute([blob('a.ts'), blob('b.ts'), blob('c.ts')])]);
+  const s = session({ maxAnswerBytes: 40 });
+
+  const first = await s.listTree({ depth: 1 });
+  assert.ok(!first.isError, 'the first listing should succeed');
+  assert.ok(s.getBytesReturned() > 0, 'a listing is repository content too');
+
+  const second = await s.listTree({ depth: 2 });
+  assert.match(second.content, /reached the amount of repository content/);
+});
+
+// A permission 403 is not a rate limit, and must not poison the bucket for the answer.
+test('a 403 without rate-limit headers is reported as permission, not rate limiting', async () => {
+  stub([tokenRoute, { match: '/search/code', status: 403, body: {} }]);
+  const s = session();
+
+  const first = await s.searchCode({ query: 'alpha' });
+  assert.match(first.content, /not allowed/i);
+
+  const callsBefore = calls.length;
+  const second = await s.searchCode({ query: 'beta' });
+  assert.ok(calls.length > callsBefore, 'the bucket must not be short-circuited by a permission 403');
+});
+
+test('an ambiguous short name is refused rather than guessed', async () => {
+  stub([tokenRoute]);
+  const two = new RepoToolSession({
+    installationId: 42,
+    repos: [
+      { repoId: 1, fullName: 'acme/api', defaultBranch: 'main' },
+      { repoId: 2, fullName: 'other/api', defaultBranch: 'main' },
+    ],
+  });
+  const result = await two.listTree({ repo: 'api' });
+  assert.strictEqual(result.isError, true);
+  assert.match(result.content, /acme\/api/);
 });
 
 test('out-of-scope results are dropped even if GitHub returns them', async () => {
@@ -318,17 +413,35 @@ test('hits in blocked files, and snippets holding secrets, are dropped from the 
 // Rate limits and result memory (§7 rules 5 and 6)
 // ---------------------------------------------------------------------------
 
-test('after a 403 the same bucket stops contacting GitHub', async () => {
-  stub([tokenRoute, { match: '/search/code', status: 403, body: {} }]);
+// Both shapes GitHub uses for "you are rate limited" short-circuit the bucket, so a
+// retrying model cannot burn the installation's quota.
+test('a 429 stops the bucket contacting GitHub again', async () => {
+  stub([tokenRoute, { match: '/search/code', status: 429, body: {} }]);
   const s = session();
 
   const first = await s.searchCode({ query: 'alpha' });
   assert.strictEqual(first.isError, true);
+  assert.match(first.content, /rate-limiting/);
   const callsAfterFirst = calls.length;
 
   const second = await s.searchCode({ query: 'beta' });
   assert.strictEqual(second.isError, true);
   assert.strictEqual(calls.length, callsAfterFirst, 'the second search must not reach GitHub');
+});
+
+test('a 403 WITH an exhausted remaining count is a rate limit', async () => {
+  stub([
+    tokenRoute,
+    { match: '/search/code', status: 403, body: {}, headers: { 'x-ratelimit-remaining': '0' } },
+  ]);
+  const s = session();
+
+  const first = await s.searchCode({ query: 'alpha' });
+  assert.match(first.content, /rate-limiting/);
+  const callsAfterFirst = calls.length;
+
+  await s.searchCode({ query: 'beta' });
+  assert.strictEqual(calls.length, callsAfterFirst, 'the bucket should be short-circuited');
 });
 
 test('an identical repeat makes no request and returns a pointer', async () => {

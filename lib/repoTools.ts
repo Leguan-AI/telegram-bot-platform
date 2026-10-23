@@ -58,6 +58,11 @@ interface RepoState {
   tree?: { entries: TreeEntry[]; truncated: boolean };
 }
 
+const BUDGET_SPENT: ToolResult = {
+  content: 'I have reached the amount of repository content I can read for one answer.',
+  isError: true,
+};
+
 const RATE_LIMITED = 'GitHub is rate-limiting these requests. I could not read any more from the repository.';
 
 export class RepoToolSession {
@@ -119,6 +124,7 @@ export class RepoToolSession {
     const key = memoryKey('list_tree', repo.ref.fullName, root.path, String(depth));
     const remembered = this.recall(key);
     if (remembered) return remembered;
+    if (this.budgetSpent()) return BUDGET_SPENT;
 
     const tree = await this.loadTree(repo);
     if ('error' in tree) return this.remember(key, tree.error);
@@ -152,7 +158,9 @@ export class RepoToolSession {
       lines.push('(GitHub truncated this repository’s tree, so the listing may be incomplete.)');
     }
 
-    return this.remember(key, { content: lines.join('\n') }, 'content');
+    const listing = lines.join('\n');
+    this.bytesReturned += listing.length;
+    return this.remember(key, { content: listing }, 'content');
   }
 
   /**
@@ -198,12 +206,7 @@ export class RepoToolSession {
       }
     }
 
-    if (this.bytesReturned >= this.limits.maxAnswerBytes) {
-      return this.remember(key, {
-        content: 'I have reached the amount of repository content I can read for one answer.',
-        isError: true,
-      });
-    }
+    if (this.budgetSpent()) return this.remember(key, BUDGET_SPENT);
 
     const fetched = await this.getContents(repo, normalized.path);
     if ('error' in fetched) return this.remember(key, fetched.error);
@@ -267,6 +270,7 @@ export class RepoToolSession {
     const key = memoryKey('search_code', repos.map((r) => r.ref.fullName).join(','), stripped);
     const remembered = this.recall(key);
     if (remembered) return remembered;
+    if (this.budgetSpent()) return BUDGET_SPENT;
 
     if (this.exhausted.has('search')) {
       return { content: RATE_LIMITED, isError: true };
@@ -287,8 +291,11 @@ export class RepoToolSession {
     const allowedIds = new Set(repos.map((repo) => repo.ref.repoId));
     const hits: string[] = [];
     for (const item of data.items || []) {
-      // Defence in depth: drop anything outside the in-scope repository ids.
-      if (item.repository?.id !== undefined && !allowedIds.has(item.repository.id)) continue;
+      // Defence in depth, and it must fail CLOSED: a hit whose repository we cannot
+      // identify is dropped, not kept. An installation token can search public code
+      // anywhere, so "unknown id" is exactly the shape a leak would take.
+      const repoId = item.repository?.id;
+      if (typeof repoId !== 'number' || !allowedIds.has(repoId)) continue;
       if (isNameBlocked(item.path)) continue;
 
       const fragment = item.text_matches?.[0]?.fragment || '';
@@ -305,12 +312,17 @@ export class RepoToolSession {
         ? `No matches for that search in ${repos.map((r) => r.ref.fullName).join(', ')}.`
         : `${hits.length} match${hits.length === 1 ? '' : 'es'}:\n\n${hits.join('\n\n')}`;
 
+    this.bytesReturned += content.length;
     return this.remember(key, { content }, hits.length > 0 ? 'content' : 'notice');
   }
 
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
+
+  private budgetSpent(): boolean {
+    return this.bytesReturned >= this.limits.maxAnswerBytes;
+  }
 
   private resolveRepo(name?: string): RepoState | null {
     if (!name) {
@@ -319,11 +331,12 @@ export class RepoToolSession {
     const wanted = name.toLowerCase();
     const direct = this.repos.get(wanted);
     if (direct) return direct;
-    // Accept the short name too; the model sees owner/name but people type the tail.
-    for (const repo of this.repos.values()) {
-      if (repo.ref.fullName.toLowerCase().endsWith(`/${wanted}`)) return repo;
-    }
-    return null;
+    // Accept the short name too; the model sees owner/name but people type the tail. An
+    // ambiguous tail is refused rather than resolved to whichever came first.
+    const tailMatches = [...this.repos.values()].filter((repo) =>
+      repo.ref.fullName.toLowerCase().endsWith(`/${wanted}`)
+    );
+    return tailMatches.length === 1 ? tailMatches[0] : null;
   }
 
   private unknownRepo(name?: string): ToolResult {
@@ -484,10 +497,24 @@ export class RepoToolSession {
       return { error: { content: 'I could not reach GitHub just now.', isError: true } };
     }
 
-    if (response.status === 403 || response.status === 429) {
+    // A 429 is always a rate limit. A 403 is only one when GitHub says so — through an
+    // exhausted remaining count or a Retry-After — because a permission 403 (an
+    // installation suspended mid-answer, say) must not poison the bucket for the rest of
+    // the answer, nor be reported to the model as rate-limiting.
+    const remaining = response.headers.get('x-ratelimit-remaining');
+    const retryAfter = response.headers.get('retry-after');
+    const rateLimited =
+      response.status === 429 || (response.status === 403 && (remaining === '0' || retryAfter !== null));
+
+    if (rateLimited) {
       this.exhausted.add(bucket);
       console.warn(`GitHub ${response.status} on ${bucket}; short-circuiting the rest of this answer.`);
       return { error: { content: RATE_LIMITED, isError: true } };
+    }
+
+    if (response.status === 403) {
+      console.warn(`GitHub 403 (not a rate limit) for ${url.split('?')[0]}`);
+      return { error: { content: 'I am not allowed to read that from the repository.', isError: true } };
     }
 
     if (!response.ok && !allowStatuses.includes(response.status)) {
@@ -546,34 +573,87 @@ function formatTreeEntry(entry: TreeEntry, prefix: string): string {
 }
 
 /**
- * Strips every GitHub search qualifier from a model-supplied query (§6, R3-B1).
+ * Strips every GitHub search qualifier from a model-supplied query (#21 §6, R3-B1).
  *
- * Anything of the form `key:value` whose key is a known qualifier goes, including the ones
- * that would widen scope (`repo`, `org`, `user`) and the ones that would merely confuse the
- * result set. We re-add only what we control.
+ * The first version matched a qualifier only at the start of the query or after
+ * whitespace, which left several ways through — all of them verified against this
+ * function, not imagined:
+ *
+ *     foo (repo:evil/x OR bar)   → untouched: `(` is not whitespace
+ *     foo +repo:evil/x           → untouched: `+` is not whitespace
+ *     owner:evil thing           → untouched: `owner` was not in the key list
+ *     repo:"quoted value" rest   → half-stripped, leaving a dangling quote
+ *
+ * That matters because an installation token can search **public** code anywhere, so a
+ * surviving `repo:` or `org:` reaches repositories nobody shared with us. The repository-id
+ * filter is the layer behind this one; neither should be load-bearing alone.
+ *
+ * So: qualifiers are matched at any non-word boundary, quoted values are consumed whole,
+ * and the boolean grammar goes too. Without that last part a leftover `OR` could make the
+ * `repo:` terms we append optional — scoping that the model can switch off is not scoping.
  */
 const QUALIFIER_KEYS = [
   'repo',
+  'repository',
   'org',
+  'organization',
+  'owner',
   'user',
+  'enterprise',
   'fork',
   'is',
   'in',
   'path',
   'language',
+  'lang',
   'filename',
   'extension',
   'size',
   'created',
   'pushed',
+  'updated',
   'stars',
+  'forks',
   'topic',
   'archived',
   'mirror',
   'license',
+  'symbol',
+  'content',
+  'base',
+  'head',
+  'author',
+  'committer',
+  'merge',
+  'state',
+  'label',
 ];
 
+/** `key:"quoted value"` or `key:bare-value`, anywhere it appears, optionally negated. */
+const QUALIFIER_PATTERN = new RegExp(
+  `(^|[^A-Za-z0-9_])[-+]?(${QUALIFIER_KEYS.join('|')}):("[^"]*"|\\S*)`,
+  'gi'
+);
+
+/** Parentheses and boolean operators, which would let the model re-structure our query. */
+const BOOLEAN_GRAMMAR = /(^|\s)(AND|OR|NOT)(\s|$)|[()]/g;
+
 export function stripSearchQualifiers(query: string): string {
-  const pattern = new RegExp(`(^|\\s)-?(${QUALIFIER_KEYS.join('|')}):\\S*`, 'gi');
-  return query.replace(pattern, ' ').replace(/\s+/g, ' ').trim();
+  if (typeof query !== 'string') return '';
+
+  let cleaned = query;
+  // Repeat: stripping one qualifier can bring the next up against a boundary that only
+  // now matches (`repo:a repo:b` and nested spellings).
+  for (let pass = 0; pass < 4; pass++) {
+    const next = cleaned.replace(QUALIFIER_PATTERN, '$1 ');
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+
+  cleaned = cleaned.replace(BOOLEAN_GRAMMAR, ' ');
+
+  // Any stray quote left behind would unbalance the query we build.
+  cleaned = cleaned.replace(/"/g, ' ');
+
+  return cleaned.replace(/\s+/g, ' ').trim();
 }
