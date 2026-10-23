@@ -18,6 +18,23 @@ export class DocumentReadError extends Error {
   }
 }
 
+/**
+ * A client-side tool definition, in the shape both providers accept (#21 §7). DeepSeek
+ * speaks the Anthropic message format through its compatible endpoint, so one shape
+ * serves both — verified live by scripts/probe-custom-tool-support.ts in #24.
+ */
+export interface CustomToolDefinition {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+}
+
+/** One turn of a tool loop. Assistant content is echoed back verbatim (§7 rule 2). */
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: any;
+}
+
 export interface CallModelInput {
   systemPrompt: string;
   userMessage: string;
@@ -26,6 +43,18 @@ export interface CallModelInput {
   isolationScopeId: string; // required; produced only by resolveIsolationScopeId()
   document?: { data: string; mediaType: string };
   webSearch?: { maxUses: number }; // NEW, optional — attach web_search server tool
+  /**
+   * Custom tools the model may call. Whenever repositories are in scope the same
+   * definitions are attached every time: the tool set sits at the start of the cached
+   * prefix, so changing it between messages resets the prompt cache (§7).
+   */
+  tools?: CustomToolDefinition[];
+  /**
+   * The conversation so far. When present it replaces `userMessage`, which is how a tool
+   * loop continues a turn: the first entry is the user's question, then the assistant's
+   * content echoed verbatim, then the tool results.
+   */
+  conversation?: ConversationMessage[];
 }
 
 export interface CallModelResult {
@@ -40,6 +69,15 @@ export interface CallModelResult {
   requestId: string | null;
   stopReason: string | null;
   webSearchRequests?: number; // NEW — surfaced from usage.server_tool_use.web_search_requests
+  /**
+   * The assistant's raw content blocks. A tool loop must echo these back unchanged — never
+   * filtered, reordered or rebuilt — because that is the only form both providers accept,
+   * and because it preserves Anthropic's signed `thinking` blocks and DeepSeek's
+   * `call_00_…` tool-call ids (§7 rule 2).
+   */
+  content?: any[];
+  /** Thinking tokens, where the provider reports them (§8). */
+  thinkingTokens?: number;
   raw?: Record<string, any>;
 }
 

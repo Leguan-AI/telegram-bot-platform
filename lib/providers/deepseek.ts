@@ -45,18 +45,27 @@ export class DeepSeekProvider implements ModelProvider {
         model: input.model,
         max_tokens: getModelMaxOutputTokens(),
         system: systemContent,
-        messages: [
-          {
-            role: 'user',
-            content: input.userMessage,
-          },
-        ],
+        messages: input.conversation
+          ? input.conversation
+          : [
+              {
+                role: 'user',
+                content: input.userMessage,
+              },
+            ],
         metadata: { user_id: input.isolationScopeId },
         thinking: { type: 'disabled' },
       };
 
+      if (input.tools && input.tools.length > 0) {
+        createParams.tools = [...(createParams.tools || []), ...input.tools];
+      }
+
       if (input.webSearch) {
+        // Appended, not assigned: §7 requires web search and custom tools in the same
+        // request, and assigning here would have silently dropped the custom ones.
         createParams.tools = [
+          ...(createParams.tools || []),
           { type: 'web_search_20250305', name: 'web_search', max_uses: input.webSearch.maxUses },
         ];
       }
@@ -71,6 +80,9 @@ export class DeepSeekProvider implements ModelProvider {
 
       return {
         text: replyText,
+        content: response.content as any[],
+        thinkingTokens:
+          (response.usage as any)?.output_tokens_details?.thinking_tokens ?? undefined,
         usage: {
           input_tokens: response.usage.input_tokens,
           output_tokens: response.usage.output_tokens,
