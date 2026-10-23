@@ -25,6 +25,32 @@ export interface ScopedRepo {
   pinned: boolean;
 }
 
+/**
+ * Telegram's stand-in sender for a message posted anonymously by a group admin. The real
+ * user is never revealed, which is the whole point of the mode — and why getChatMember has
+ * nobody to check.
+ */
+export const GROUP_ANONYMOUS_BOT_ID = 1087968824;
+
+export interface SenderShape {
+  from?: { id?: number | null } | null;
+  sender_chat?: { id?: number | null } | null;
+  chat: { id?: number | null };
+}
+
+/**
+ * True when a message was sent anonymously as the group (#21 §3a).
+ *
+ * Two signals, because Telegram gives both: `from` is replaced with GroupAnonymousBot, and
+ * `sender_chat` is the group itself. Checking `from` for null does NOT work — it is always
+ * populated — which is why this exists rather than an inline test.
+ */
+export function isAnonymousGroupSender(message: SenderShape): boolean {
+  if (message.from?.id === GROUP_ANONYMOUS_BOT_ID) return true;
+  const senderChatId = message.sender_chat?.id;
+  return senderChatId !== undefined && senderChatId !== null && senderChatId === message.chat?.id;
+}
+
 export type ReposCommand =
   | { action: 'view' }
   | { action: 'pin'; names: string[] }
@@ -96,8 +122,11 @@ function repoLine(repo: ScopedRepo): string {
 }
 
 export interface RepoScopeView {
-  /** The connection's state, which decides whether any of this is usable. */
-  status: 'none' | 'pending_confirmation' | 'suspended' | 'active';
+  /**
+   * The connection's state, plus 'unavailable' for the case where we could not work it out
+   * at all — a database or GitHub failure. Saying so beats implying nothing is linked.
+   */
+  status: 'none' | 'pending_confirmation' | 'suspended' | 'active' | 'unavailable';
   repos: ScopedRepo[];
   /** True when the topic is pinned, i.e. narrowed below what the group offers. */
   isPinned: boolean;
@@ -116,7 +145,10 @@ export function buildRepoListing(view: RepoScopeView): string {
     return '<b>Repositories</b>\n<i>A GitHub connection is waiting for a workspace admin to confirm it. Nothing can be read until then.</i>';
   }
   if (view.status === 'suspended') {
-    return '<b>Repositories</b>\n<i>The GitHub installation is suspended, so I cannot read any code right now.</i>';
+    return '<b>Repositories</b>\n<i>The GitHub installation is suspended, so none of these are available right now.</i>';
+  }
+  if (view.status === 'unavailable') {
+    return '<b>Repositories</b>\n<i>I could not check which repositories are linked here just now.</i>';
   }
   if (view.repos.length === 0) {
     return '<b>Repositories</b>\n<i>None linked here yet. A workspace admin links them in the dashboard.</i>';
@@ -124,7 +156,7 @@ export function buildRepoListing(view: RepoScopeView): string {
 
   const lines = ['<b>Repositories</b>'];
   if (view.namesUnavailable) {
-    lines.push('<i>GitHub did not answer just now, so these are repository ids.</i>');
+    lines.push('<i>GitHub did not name all of these, so some are shown as repository ids.</i>');
   }
   lines.push(...view.repos.map(repoLine));
   lines.push(
@@ -142,6 +174,7 @@ export function buildContextRepoLine(view: RepoScopeView): string {
   if (view.status === 'none') return '<b>GitHub:</b> <i>— not connected</i>';
   if (view.status === 'pending_confirmation') return '<b>GitHub:</b> <i>— awaiting admin confirmation</i>';
   if (view.status === 'suspended') return '<b>GitHub:</b> <i>— installation suspended</i>';
+  if (view.status === 'unavailable') return '<b>GitHub:</b> <i>— could not be checked just now</i>';
   if (view.repos.length === 0) return '<b>GitHub:</b> <i>— none linked here</i>';
 
   const names = view.repos
@@ -156,6 +189,9 @@ export const REPOS_ANONYMOUS_ADMIN =
   'Turn off anonymous admin mode to change repo pins — I cannot check admin rights for a message sent as the group.';
 
 export const REPOS_NOT_ADMIN = 'Only a group admin can change which repositories this topic uses.';
+
+export const REPOS_PINS_NOW_EMPTY =
+  'That was the last pin — this topic is back to the group\u2019s repositories.';
 
 export const REPOS_NOT_IN_TOPIC =
   'Pins only apply inside a topic. Here I use every repository linked to this group.';
@@ -177,7 +213,7 @@ export function buildReposHelp(command: ReposCommand & { action: 'help' }): stri
   return [
     lead,
     '',
-    '<code>/repos</code> — what I can read here',
+    '<code>/repos</code> — what is linked here',
     '<code>/repos pin &lt;name&gt; …</code> — narrow this topic to those repositories (admins)',
     '<code>/repos unpin &lt;name&gt;</code> — remove a pin (admins)',
     '<code>/repos clear</code> — go back to the group\'s repositories (admins)',

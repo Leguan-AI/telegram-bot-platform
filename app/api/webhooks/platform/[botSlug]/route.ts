@@ -50,11 +50,13 @@ import {
   buildRepoListing,
   buildReposHelp,
   buildUnknownReposReply,
+  isAnonymousGroupSender,
   parseReposCommand,
   resolveRepoNames,
   REPOS_ANONYMOUS_ADMIN,
   REPOS_NOT_ADMIN,
   REPOS_NOT_IN_TOPIC,
+  REPOS_PINS_NOW_EMPTY,
 } from '@/lib/reposCommand';
 import {
   getActiveInstallationRow,
@@ -714,10 +716,16 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
             }
 
             // An anonymous admin posts as the group itself, so getChatMember has nobody to
-            // check. Say so rather than failing silently (§3a).
+            // check. Say so rather than failing silently (§3a). Telegram fills `from` with
+            // GroupAnonymousBot rather than leaving it empty, so this needs both signals.
+            if (isAnonymousGroupSender(message)) {
+              await reply(REPOS_ANONYMOUS_ADMIN);
+              return;
+            }
+
             const callerId = message.from?.id ?? null;
             if (callerId === null) {
-              await reply(REPOS_ANONYMOUS_ADMIN);
+              await reply(REPOS_NOT_ADMIN);
               return;
             }
 
@@ -832,14 +840,19 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
               groupId: group.id,
               telegramThreadId: threadId,
             });
+            const listing = buildRepoListing({
+              status: updated.status,
+              repos: updated.repos,
+              isPinned: updated.isPinned,
+              inTopic: true,
+              namesUnavailable: updated.namesUnavailable,
+            });
+            // Removing the last pin widens the topic back to the group's repositories.
+            // That follows from the model, but it should not be silent.
             await reply(
-              buildRepoListing({
-                status: updated.status,
-                repos: updated.repos,
-                isPinned: updated.isPinned,
-                inTopic: true,
-                namesUnavailable: updated.namesUnavailable,
-              })
+              command.action === 'unpin' && next.length === 0
+                ? `${REPOS_PINS_NOW_EMPTY}\n\n${listing}`
+                : listing
             );
           } catch (err) {
             console.error('Error handling /repos:', err);
@@ -863,12 +876,18 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
             const totalDocs = entityDocs.length + groupDocs.length + topicDocs.length;
 
             // Repositories are context too (#21 §9). Resolved separately because their
-            // names live at GitHub, not in the database.
-            const repoScope = await resolveRepoScope({
-              entityId: entity.id,
-              groupId: group.id,
-              telegramThreadId: threadId,
-            });
+            // names live at GitHub, not in the database — and in its own try, so a database
+            // hiccup or a GitHub outage costs one line rather than the whole reply.
+            let repoScope: Awaited<ReturnType<typeof resolveRepoScope>> | null = null;
+            try {
+              repoScope = await resolveRepoScope({
+                entityId: entity.id,
+                groupId: group.id,
+                telegramThreadId: threadId,
+              });
+            } catch (repoErr) {
+              console.error('Could not resolve repository scope for /context:', repoErr);
+            }
 
             const entityText = entityDocs.length > 0
               ? `✓ ${entityDocs.length} document${entityDocs.length === 1 ? '' : 's'}`
@@ -886,19 +905,23 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
               `<b>Entity:</b> ${entityText}`,
               `<b>Group:</b> ${groupText}`,
               `<b>Topic:</b> ${topicText}`,
-              buildContextRepoLine({
-                status: repoScope.status,
-                repos: repoScope.repos,
-                isPinned: repoScope.isPinned,
-                inTopic: threadId !== null,
-                namesUnavailable: repoScope.namesUnavailable,
-              }),
+              buildContextRepoLine(
+                repoScope
+                  ? {
+                      status: repoScope.status,
+                      repos: repoScope.repos,
+                      isPinned: repoScope.isPinned,
+                      inTopic: threadId !== null,
+                      namesUnavailable: repoScope.namesUnavailable,
+                    }
+                  : { status: 'unavailable', repos: [], isPinned: false, inTopic: threadId !== null }
+              ),
               '',
             ];
 
             if (totalDocs > 0) {
               summaryLines.push(`📎 Full text attached below ↓`);
-            } else if (repoScope.repos.length === 0) {
+            } else if (!repoScope || repoScope.repos.length === 0) {
               summaryLines.push(`<i>No context is configured for this topic yet.</i>`);
             } else {
               // Deliberately not "I answer from the repositories above": linking decides

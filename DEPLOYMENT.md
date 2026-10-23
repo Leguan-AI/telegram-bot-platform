@@ -451,7 +451,7 @@ curl "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
     {"command":"context","description":"See what docs the bot answers from here"},
     {"command":"recap","description":"Summarize the last messages in this topic"},
     {"command":"auth","description":"Link this group to a workspace"},
-    {"command":"repos","description":"See or pin the code repos the bot uses here"}
+    {"command":"repos","description":"See or pin the code repos linked here"}
   ]}'
 ```
 

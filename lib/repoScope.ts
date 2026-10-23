@@ -120,7 +120,9 @@ export async function resolveRepoScope(input: {
       };
     }),
     isPinned,
-    namesUnavailable: names.size === 0,
+    // Any miss, not only a total failure: a partial lookup otherwise shows a bare #id with
+    // nothing to explain it.
+    namesUnavailable: names.size < repoIds.length,
   };
 }
 

@@ -5,6 +5,8 @@ import { test } from 'node:test';
 import assert from 'assert';
 
 import {
+  GROUP_ANONYMOUS_BOT_ID,
+  isAnonymousGroupSender,
   buildContextRepoLine,
   buildRepoListing,
   buildReposHelp,
@@ -200,4 +202,82 @@ test('help lists the subcommands', () => {
   assert.match(help, /\/repos pin/);
   assert.match(help, /\/repos unpin/);
   assert.match(help, /\/repos clear/);
+});
+
+// ---------------------------------------------------------------------------
+// Anonymous admins (#21 §3a)
+//
+// Telegram does not leave `from` empty for an anonymous admin — it substitutes
+// GroupAnonymousBot and sets sender_chat to the group. Checking `from` for null therefore
+// never fires, which is the bug this covers.
+// ---------------------------------------------------------------------------
+
+test('an anonymous admin is recognised by either signal', () => {
+  const chat = { id: -100123 };
+
+  assert.strictEqual(
+    isAnonymousGroupSender({ chat, from: { id: GROUP_ANONYMOUS_BOT_ID }, sender_chat: { id: -100123 } }),
+    true,
+    'both signals present'
+  );
+  assert.strictEqual(
+    isAnonymousGroupSender({ chat, from: { id: GROUP_ANONYMOUS_BOT_ID } }),
+    true,
+    'GroupAnonymousBot alone'
+  );
+  assert.strictEqual(
+    isAnonymousGroupSender({ chat, sender_chat: { id: -100123 } }),
+    true,
+    'posting as the group alone'
+  );
+});
+
+test('an ordinary member is not treated as anonymous', () => {
+  const chat = { id: -100123 };
+  assert.strictEqual(isAnonymousGroupSender({ chat, from: { id: 55 } }), false);
+  assert.strictEqual(isAnonymousGroupSender({ chat, from: { id: 55 }, sender_chat: null }), false);
+});
+
+// A linked channel forwarding into the group is not an anonymous admin of *this* group, so
+// it falls through to the ordinary admin check rather than getting the wrong advice.
+test('a message from another chat is not this group posting anonymously', () => {
+  assert.strictEqual(
+    isAnonymousGroupSender({ chat: { id: -100123 }, from: { id: 55 }, sender_chat: { id: -100999 } }),
+    false
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Copy: nothing may claim the bot reads code until the tools land (#21 §5-§7)
+// ---------------------------------------------------------------------------
+
+test('no listing or help text claims the bot reads code', () => {
+  const texts = [
+    buildRepoListing({ status: 'active', repos: [api], isPinned: false, inTopic: true }),
+    buildRepoListing({ status: 'suspended', repos: [], isPinned: false, inTopic: true }),
+    buildReposHelp({ action: 'help', reason: 'unknown_subcommand', subcommand: 'x' }),
+  ];
+  for (const text of texts) {
+    assert.ok(!/\bread\b/i.test(text), `copy should not promise reading: ${text}`);
+  }
+});
+
+test('an unresolvable scope says so rather than looking empty', () => {
+  const listing = buildRepoListing({ status: 'unavailable', repos: [], isPinned: false, inTopic: true });
+  assert.match(listing, /could not check/i);
+  assert.ok(!/None linked here/.test(listing), 'unavailable must not read as "nothing linked"');
+
+  const line = buildContextRepoLine({ status: 'unavailable', repos: [], isPinned: false, inTopic: true });
+  assert.match(line, /could not be checked/i);
+});
+
+test('a partial name lookup is explained, not shown as bare ids', () => {
+  const listing = buildRepoListing({
+    status: 'active',
+    repos: [api, repo(7, '#7')],
+    isPinned: false,
+    inTopic: true,
+    namesUnavailable: true,
+  });
+  assert.match(listing, /some are shown as repository ids/i);
 });
