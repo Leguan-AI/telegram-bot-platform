@@ -628,7 +628,10 @@ Redeploy so the new values are picked up.
 6. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
    (GitHub's own error text is never shown to the user). If the repository list does not load,
    check `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` — the picker needs an installation token,
-   which the connect flow did not.
+   which the connect flow did not. If an owner lands on **"GitHub did not ask you to authorize"**,
+   check that **Request user authorization (OAuth) during installation** is still on in A8e.1:
+   the connect flow already falls back to the authorization endpoint for an account that has the
+   App installed, so reaching that page means the setting itself is off.
 
 > Nothing in this section is per-tenant. A second directory connecting a different GitHub account
 > needs no operator involvement.

@@ -82,6 +82,24 @@ export function buildInstallUrl(state: string): string {
   return `https://github.com/apps/${getGitHubAppSlug()}/installations/new?state=${encodeURIComponent(state)}`;
 }
 
+/**
+ * The plain OAuth authorization URL, used as a second hop when the install flow comes back
+ * without a `code` (#21 §2).
+ *
+ * GitHub issues a `code` on the **install** leg only. Reconfiguring an installation that
+ * already exists — which is what the install link shows an owner whose account already has
+ * the App — redirects straight back with `installation_id` and `setup_action=update` and no
+ * code at all. Without a code there is no user token, and without a user token there is no
+ * owner check, so the connect cannot complete.
+ *
+ * This endpoint always yields a code, so the callback sends the owner here once and
+ * continues with the check it already knows how to do.
+ */
+export function buildAuthorizeUrl(state: string): string {
+  const { clientId } = getOAuthCredentials();
+  return `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${encodeURIComponent(state)}`;
+}
+
 function apiHeaders(token: string): Record<string, string> {
   return {
     Accept: 'application/vnd.github+json',

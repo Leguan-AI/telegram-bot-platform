@@ -12,6 +12,7 @@
  */
 
 import { sql } from '@/lib/supabase';
+import { isConnectTokenShape } from '@/lib/connectState';
 import type { GitHubAccountType } from '@/lib/githubApp';
 
 /** Reasons the DB can refuse a connect. Mirrors the raises in the migration. */
@@ -46,13 +47,6 @@ function toConnectDbError(err: unknown): ConnectDbError {
   const message = err instanceof Error ? err.message : String(err);
   const match = KNOWN_REASONS.find((reason) => reason === message);
   return new ConnectDbError(match ?? 'db_error', message);
-}
-
-/** Token format as minted by mint_github_connect_token: 26 Crockford base32 chars. */
-const TOKEN_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/;
-
-export function isConnectTokenShape(value: string): boolean {
-  return TOKEN_PATTERN.test(value);
 }
 
 export interface ConnectInvitePreview {

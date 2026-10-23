@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import {
   assertInstallationNotSuspended,
   assertInstallationOwner,
+  buildAuthorizeUrl,
   exchangeUserCode,
   findUserInstallation,
   getAuthenticatedUser,
@@ -9,7 +10,8 @@ import {
   revokeUserToken,
   GitHubConnectError,
 } from '@/lib/githubApp';
-import { completeGitHubConnect, ConnectDbError, isConnectTokenShape } from '@/lib/githubConnect';
+import { completeGitHubConnect, ConnectDbError } from '@/lib/githubConnect';
+import { buildConnectState, parseConnectState } from '@/lib/connectState';
 import type { ConnectResultCode } from '@/lib/githubConnectUi';
 
 // A handful of sequential GitHub calls plus one database round trip.
@@ -48,7 +50,8 @@ export async function GET(req: NextRequest) {
     return redirectToStatus(req, 'missing_state');
   }
 
-  if (!isConnectTokenShape(state)) {
+  const parsedState = parseConnectState(state);
+  if (!parsedState) {
     return redirectToStatus(req, 'invalid_token');
   }
 
@@ -57,15 +60,34 @@ export async function GET(req: NextRequest) {
     return redirectToStatus(req, 'server_error');
   }
 
-  // Without `code` we cannot verify ownership, which usually means the App's "Request
-  // user authorization (OAuth) during installation" setting is off.
-  if (!code) {
-    return redirectToStatus(req, 'missing_code');
-  }
+  // The installation id comes from the URL on the install leg, and from the state on the
+  // authorization hop, which GitHub sends back without one. Either way it is untrusted and
+  // verified below against the authorizing user's own installations.
+  const installationId = installationIdRaw
+    ? Number(installationIdRaw)
+    : parsedState.installationId ?? NaN;
 
-  const installationId = Number(installationIdRaw);
   if (!Number.isSafeInteger(installationId) || installationId <= 0) {
     return redirectToStatus(req, 'missing_installation');
+  }
+
+  // No code, but an installation: GitHub issues a code on the *install* leg only, and an
+  // owner whose account already has the App gets the configure screen instead — which
+  // redirects back with setup_action=update and nothing to authenticate with. Send them
+  // through the authorization endpoint once, which always returns a code, and come back
+  // here with the same single-use token.
+  //
+  // The suffix on the state is what makes this terminate: if we return still without a
+  // code, the App's "Request user authorization (OAuth) during installation" setting is
+  // genuinely off and no number of redirects will help.
+  if (!code) {
+    if (parsedState.installationId !== null) {
+      console.warn(
+        `GitHub connect: no code after the authorization hop for installation ${installationId}.`
+      );
+      return redirectToStatus(req, 'missing_code');
+    }
+    return NextResponse.redirect(buildAuthorizeUrl(buildConnectState(parsedState.token, installationId)));
   }
 
   let userToken: string | null = null;
@@ -89,7 +111,7 @@ export async function GET(req: NextRequest) {
     assertInstallationNotSuspended(installation);
 
     const result = await completeGitHubConnect({
-      code: state,
+      code: parsedState.token,
       installationId: installation.id,
       accountId: installation.accountId,
       accountLogin: installation.accountLogin,
