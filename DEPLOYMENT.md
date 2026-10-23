@@ -185,6 +185,7 @@ Current migrations that need a push beyond the init schema include:
 | `20261022000000_dashboard_context_management.sql` | the dashboard context-document functions (`list_context_docs` / `get_managed_context` / `save_managed_context`) — see the dashboard content section below |
 | **`20261022010000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
 | **`20261022020000_repo_link_management.sql`** | **repository linking: `list_repo_links` for the dashboard, `set_repo_links` and `get_github_connection_for_admin` for the server routes, and two more scope invariants on the `repo_links` trigger (no group from another entity, no thread from another group). Required before the picker in the GitHub tab can save.** |
+| **`20261023000000_github_webhooks.sql`** | **GitHub webhooks: the `github_webhook_deliveries` dedupe table and `resolve_github_installation`, the bootstrap resolver that replaces the dormant `resolve_entity_id_by_repo`. Required before `/api/webhooks/github` can do anything but reject.** |
 
 > After pushing the GitHub App migration, verify the new tables carry both flags:
 > ```sql
@@ -193,6 +194,28 @@ Current migrations that need a push beyond the init schema include:
 >   and relname in ('github_installations','repo_links','github_connect_invites');
 > ```
 > All three rows must show `t` / `t`.
+
+## A5d. Webhook delivery retention (operator step)
+
+The GitHub webhook de-duplicates on `X-GitHub-Delivery` so a delivery redelivered by hand
+from the App's settings cannot apply an event twice. Those ids live in
+`public.github_webhook_deliveries` and are kept **7 days** — long enough to cover manual
+redelivery, which is the only retry that exists (GitHub does not retry on its own).
+
+Schedule the purge alongside the `telegram_events` job from A5b.2:
+
+```sql
+select cron.schedule(
+  'github-webhook-deliveries-retention',
+  '15 0 * * *',
+  $$ delete from public.github_webhook_deliveries
+     where created_at < now() - interval '7 days' $$
+);
+```
+
+The table is tiny — one short row per delivery, and the App subscribes to no events beyond
+the two GitHub sends automatically — so it needs no batching. Skipping this step costs
+disk slowly rather than breaking anything.
 
 ## A6. Table privileges for `bot_service` (now handled by the migration)
 
@@ -295,7 +318,7 @@ values (
    | `GITHUB_APP_CLIENT_ID` | the App's Client ID | **Yes** | GitHub App (A8e). Used for the one-shot user-token exchange and its revocation. |
    | `GITHUB_APP_CLIENT_SECRET` | the App's client secret | **Yes** | GitHub App (A8e). Generated once, shown once. |
    | `GITHUB_APP_PRIVATE_KEY` | PEM contents of the App private key | **Yes** | GitHub App (A8e). Literal `\n` escapes or a real multi-line value both work; read by the repository picker and the link save. Downloadable only at generation, so store it then. |
-   | `GITHUB_APP_WEBHOOK_SECRET` | the App's webhook secret | **Yes** | GitHub App (A8e). HMAC over the raw body on `/api/webhooks/github`. **Not read yet** (arrives with the webhook route). Distinct from `GITHUB_WEBHOOK_SECRET` above — do not reuse that one. |
+   | `GITHUB_APP_WEBHOOK_SECRET` | the App's webhook secret | **Yes** | GitHub App (A8e). HMAC over the raw body on `/api/webhooks/github`; without it that route answers 500 and every delivery fails. Distinct from `GITHUB_WEBHOOK_SECRET` above — do not reuse that one. |
    | `NEXT_PUBLIC_SUPABASE_URL` | your Supabase project URL | No | Public by design; required for client-side Auth & DB queries. |
    | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | your Supabase publishable key (`sb_publishable_...`) | No | Public by design (browser-exposed, RLS-enforced); required for client-side Auth & DB. |
    | `NEXT_PUBLIC_APP_NAME` | the brand-config product name | No | Custom branding; defaults to `'Agent Platform'`. |
@@ -328,7 +351,7 @@ values (
 
    > `[VERIFY]` The current code reads `DATABASE_URL`, `ANTHROPIC_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the client-exposed variables `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_APP_NAME`, and `NEXT_PUBLIC_APP_URL` for brand management and OTP redirects. It also reads `DEEPSEEK_API_KEY` (only on a DeepSeek model), `MODEL_IDENTIFIER`, `MODEL_MAX_OUTPUT_TOKENS`, `CONTEXT_MESSAGE_HISTORY_LIMIT`, `APP_HMAC_PEPPER` and `PRIVACY_POLICY_URL`.
    >
-   > Of the GitHub App variables (A8e), the code reads **five** today: `GITHUB_APP_SLUG`, `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET` for the connect flow (`lib/githubApp.ts`, `/api/github/install`, `/api/github/callback`), plus `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for the installation tokens the repository picker and the link save mint (`lib/githubAppToken.ts`, `/api/github/repositories`, `/api/github/repo-links`). **`GITHUB_APP_WEBHOOK_SECRET` is still unread**; it starts mattering with the webhook route. Set it regardless — the private key can only be downloaded at the moment it is generated. Confirm no other env vars are expected.
+   > Of the GitHub App variables (A8e), the code now reads **all six**: `GITHUB_APP_SLUG`, `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET` for the connect flow (`lib/githubApp.ts`, `/api/github/install`, `/api/github/callback`); `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for the installation tokens the repository picker and the link save mint (`lib/githubAppToken.ts`, `/api/github/repositories`, `/api/github/repo-links`); and `GITHUB_APP_WEBHOOK_SECRET` for the webhook route (`lib/githubWebhook.ts`, `/api/webhooks/github`). Confirm no other env vars are expected.
 
 3. Deploy. Note the production URL Vercel assigns.
 
@@ -581,7 +604,15 @@ Redeploy so the new values are picked up.
    per linked Telegram group. Tick one and press **Save repositories**; the list of links is what
    decides what the bot can read, and only numeric repository ids are stored, so a rename on
    GitHub cannot break or redirect a link.
-5. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
+5. **Check the webhook.** In the App's settings → **Advanced**, the recent deliveries list
+   should show green ticks for the `installation` event from the install you just did. Then
+   change the shared repositories on GitHub (Configure → add or remove one) and confirm an
+   `installation_repositories` delivery arrives and succeeds; un-sharing a repository that was
+   linked should make it disappear from the dashboard's link list. A **401** in that list means
+   `GITHUB_APP_WEBHOOK_SECRET` does not match the secret in the App's settings; a **500** means
+   it is unset in Vercel. Redeliver from the same page after fixing — a failed delivery releases
+   its id, so a redelivery is applied rather than dismissed as a duplicate.
+6. If a connect attempt fails, the status page names the reason; the Vercel logs carry the detail
    (GitHub's own error text is never shown to the user). If the repository list does not load,
    check `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` — the picker needs an installation token,
    which the connect flow did not.
@@ -906,7 +937,7 @@ select vault.update_secret(
 
 **Content (v1):** lives directly in `doc_cache`, edited from the `/manage` dashboard (entity-wide and per-group documents) or pushed via `/push` / SQL (B2). No GitHub in the v1 path; the store is abstracted so sync-sources (GitHub/Drive/Notion/etc.) can populate the cache later — see `docs/VISION.md`.
 
-**The four `SECURITY DEFINER` RLS-bypass functions** (the only sanctioned bypass surfaces): `resolve_entity_id_by_slug`, `resolve_entity_id_by_repo` (GitHub sync, dormant in v1), `get_current_entity_secret` (entity-scoped secret access — `github_token_id`, plus the now-unused telegram refs until Phase 3.1 drops them), and `get_current_bot_secret` (Phase 3 — scopes Vault access to the current bot's token/webhook secret). Plus two non-secret bootstrap resolvers granted to `bot_service`: `resolve_bot_id_by_slug` and `resolve_entity_id_by_chat`. See `SECURITY-PROPOSAL.md` and `docs/specs/SPEC-phase-3-bot-cutover.md`.
+**The four `SECURITY DEFINER` RLS-bypass functions** (the only sanctioned bypass surfaces): `resolve_entity_id_by_slug`, `resolve_github_installation` (GitHub webhook bootstrap — replaced the dormant `resolve_entity_id_by_repo`, which was dropped), `get_current_entity_secret` (entity-scoped secret access — `github_token_id`, plus the now-unused telegram refs until Phase 3.1 drops them), and `get_current_bot_secret` (Phase 3 — scopes Vault access to the current bot's token/webhook secret). Plus two non-secret bootstrap resolvers granted to `bot_service`: `resolve_bot_id_by_slug` and `resolve_entity_id_by_chat`. See `SECURITY-PROPOSAL.md` and `docs/specs/SPEC-phase-3-bot-cutover.md`.
 
 **Prerequisite ordering (the parts that bite if done out of order):** Vault verified → `bot_service` role created → migration run (grants included) → platform bot created (`bots` row) → app deployed (pooler `DATABASE_URL`) → domain live → platform webhook registered (A8c).
 

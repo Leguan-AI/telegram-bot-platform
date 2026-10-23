@@ -21,7 +21,7 @@ Since the `bot_service` role is subject to RLS, a query to any tenant table (lik
 
 To resolve the circular bootstrapping problem and decrypt secrets securely without exposing the entire database or Vault, the database exposes exactly **three** tightly-scoped, RLS-bypassing helper functions:
 * **`resolve_entity_id_by_slug(p_slug text)`**: A `security definer` function that searches `entities` and returns **only** the matching UUID `id` (and no other data).
-* **`resolve_entity_id_by_repo(p_owner text, p_repo text)`**: A `security definer` function that resolves a repository owner/name to its matching UUID `id`.
+* **`resolve_github_installation(p_installation_id bigint)`**: A `security definer` function that resolves a GitHub App installation id to its entity id, installation row id, status and repository selection — the bootstrap for the GitHub webhook, which arrives with an installation id and no tenant context. It replaced the dormant `resolve_entity_id_by_repo` (GitHub sync-source, never enabled) so the number of bypass functions did not grow.
 * **`get_current_entity_secret(p_secret_id uuid)`**: A `security definer` function that returns the decrypted secret string from `vault.decrypted_secrets` **only** if the secret is referenced by the active session tenant (`app.current_entity_id`).
 
 Once the Next.js app resolves the UUID, it runs all subsequent database operations inside the RLS tenant context using `withTenantContext`:
