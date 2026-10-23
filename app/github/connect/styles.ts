@@ -50,6 +50,13 @@ export const button: CSSProperties = {
   fontWeight: 600,
 };
 
+/** Paired with `button` when a page offers two ways onward. */
+export const buttonSecondary: CSSProperties = {
+  background: '#ffffff',
+  color: '#111827',
+  border: '1px solid #d1d5db',
+};
+
 export const muted: CSSProperties = {
   fontSize: '0.875rem',
   color: '#6b7280',

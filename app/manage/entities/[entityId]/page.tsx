@@ -4,7 +4,11 @@ import { Fragment, useEffect, useState, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
-import { GITHUB_CONNECT_DISCLOSURES, ALL_REPOS_WARNING } from '@/lib/githubConnectUi';
+import {
+  GITHUB_CONNECT_DISCLOSURES,
+  ALL_REPOS_WARNING,
+  ALL_REPOS_SHARED_NOTE,
+} from '@/lib/githubConnectUi';
 import '../../manage.css';
 import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
 import { RepoLinkSection, type RepoLinkRow, type RepoOption } from './RepoLinkEditor';
@@ -913,6 +917,15 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                         <li key={line} style={{ marginBottom: '0.35rem' }}>{line}</li>
                       ))}
                     </ul>
+                    {/* §8: the recommendation belongs here, where the choice is still
+                        ahead of whoever is about to make it. */}
+                    <div className="alert alert-warning" style={{ marginTop: '1.25rem' }}>
+                      <span>
+                        <strong>On the GitHub screen, choose &ldquo;Only select repositories&rdquo;.</strong>{' '}
+                        {ALL_REPOS_WARNING}
+                      </span>
+                    </div>
+
                     <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginTop: '1rem' }}>
                       <button
                         onClick={handleConnectGithub}
@@ -1001,9 +1014,11 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                       </table>
                     </div>
 
+                    {/* Informational, not an error: the connection is fine, the scope is
+                        simply wider than we recommend. */}
                     {githubConnection.repository_selection === 'all' && (
-                      <div className="alert alert-error" style={{ marginTop: '1.5rem' }}>
-                        <strong>All repositories are shared.</strong> {ALL_REPOS_WARNING}
+                      <div className="alert alert-info" style={{ marginTop: '1.5rem' }}>
+                        <strong>All repositories are shared.</strong> {ALL_REPOS_SHARED_NOTE}
                       </div>
                     )}
 
@@ -1049,7 +1064,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                         <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
                           Disconnecting removes every repository link in this directory. The owner
                           can also change the shared repositories, or remove the installation, on
-                          GitHub — that applies here immediately.
+                          GitHub; the repository list above reflects that immediately.
                         </p>
                       </div>
                     )}

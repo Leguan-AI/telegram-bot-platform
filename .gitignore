@@ -51,3 +51,6 @@ supabase/.temp/
 # probe transcripts (scripts/probe-custom-tool-support.ts PROBE_DUMP output)
 probe-dump*.json
 *-probe-dump.json
+
+# Local dev-server config for the Claude Code browser preview (per-machine)
+.claude/launch.json

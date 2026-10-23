@@ -73,7 +73,10 @@ export default async function GitHubConnectInvitePage({
         </ul>
       </div>
 
-      <div style={s.warning}>{ALL_REPOS_WARNING}</div>
+      <div style={s.warning}>
+        <strong>On the GitHub screen, choose &ldquo;Only select repositories&rdquo;.</strong>{' '}
+        {ALL_REPOS_WARNING}
+      </div>
 
       <p>
         On the next screen GitHub asks which repositories to share and asks you to authorize as
