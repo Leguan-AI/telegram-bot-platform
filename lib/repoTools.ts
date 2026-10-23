@@ -27,9 +27,7 @@ import {
 import {
   SENSITIVE_FILE_REPLY,
   INVALID_PATH_REPLY,
-  checkFile,
   filterListing,
-  findContentSecret,
   isNameBlocked,
   normalizeRepoPath,
 } from '@/lib/sensitiveFiles';
@@ -224,16 +222,10 @@ export class RepoToolSession {
       });
     }
 
-    // Content rules run on the WHOLE file, before any truncation (§6 rule 5): a key below
-    // the cap must not slip through because the cap cut above it.
-    const verdict = checkFile(normalized.path, file.text);
-    if (!verdict.allowed) {
-      if (verdict.reason === 'content_blocked') {
-        console.info(`read_file refused ${repo.ref.fullName}/${normalized.path}: ${verdict.rule}`);
-      }
-      return this.remember(key, { content: SENSITIVE_FILE_REPLY });
-    }
-
+    // No content inspection here: the policy blocks by name (see lib/sensitiveFiles.ts for
+    // why content regexes were measured and dropped — they blocked documentation far more
+    // often than secrets). The name check above already ran, before anything that could
+    // reveal whether the file exists.
     const budgetLeft = Math.max(0, this.limits.maxAnswerBytes - this.bytesReturned);
     const allowance = Math.min(this.limits.maxFileBytes, budgetLeft);
     const truncated = file.text.length > allowance;
@@ -299,8 +291,6 @@ export class RepoToolSession {
       if (isNameBlocked(item.path)) continue;
 
       const fragment = item.text_matches?.[0]?.fragment || '';
-      // A snippet that trips a content rule takes its hit with it: no path, no snippet.
-      if (findContentSecret(fragment)) continue;
 
       hits.push(fragment ? `${item.path}\n    ${fragment.trim().split('\n').join('\n    ')}` : item.path);
       if (hits.length >= this.limits.maxSearchResults) break;

@@ -203,13 +203,16 @@ test('an oversized file is truncated with an explicit marker', async () => {
   assert.match(result.content, /… truncated: src\/auth\.ts is 500 characters, showing the first 100\./);
 });
 
-// The cap must not be able to hide a key that sits below it.
-test('content rules run on the whole file, before truncation', async () => {
-  const withKey = `${'x'.repeat(200)}\nsk-ant-${'a'.repeat(24)}\n`;
-  stub([tokenRoute, shaRoute, treeRoute([blob('src/auth.ts')]), fileRoute(withKey)]);
-  const result = await session({ maxFileBytes: 50 }).readFile({ path: 'src/auth.ts' });
+// The policy blocks by name, not by content — measured, and recorded in
+// lib/sensitiveFiles.ts. A source file is returned whatever it happens to contain; the
+// files credentials actually live in never get this far, because their names are refused.
+test('an ordinary file is returned whatever it contains', async () => {
+  const withToken = `const key = "sk-ant-${'a'.repeat(24)}";`;
+  stub([tokenRoute, shaRoute, treeRoute([blob('src/auth.ts')]), fileRoute(withToken)]);
+  const result = await session().readFile({ path: 'src/auth.ts' });
 
-  assert.strictEqual(result.content, SENSITIVE_FILE_REPLY);
+  assert.match(result.content, /const key =/);
+  assert.notStrictEqual(result.content, SENSITIVE_FILE_REPLY);
 });
 
 test('binary files and LFS pointers are described, not dumped', async () => {
@@ -405,7 +408,7 @@ test('out-of-scope results are dropped even if GitHub returns them', async () =>
   assert.match(result.content, /^1 match/);
 });
 
-test('hits in blocked files, and snippets holding secrets, are dropped from the count', async () => {
+test('hits in name-blocked files are dropped from the count', async () => {
   stub([
     tokenRoute,
     {
@@ -413,8 +416,8 @@ test('hits in blocked files, and snippets holding secrets, are dropped from the 
       body: {
         items: [
           { path: '.env', repository: { id: 1 }, text_matches: [{ fragment: 'API_KEY=1' }] },
+          { path: 'apps/.env.local', repository: { id: 1 }, text_matches: [{ fragment: 'API_KEY=2' }] },
           { path: 'src/ok.ts', repository: { id: 1 }, text_matches: [{ fragment: 'const ok = true' }] },
-          { path: 'src/leak.ts', repository: { id: 1 }, text_matches: [{ fragment: `token = "sk-ant-${'a'.repeat(24)}"` }] },
         ],
       },
     },
@@ -422,7 +425,6 @@ test('hits in blocked files, and snippets holding secrets, are dropped from the 
   const result = await session().searchCode({ query: 'token' });
 
   assert.ok(!result.content.includes('.env'), 'name-blocked hits must not appear');
-  assert.ok(!result.content.includes('leak.ts'), 'a secret-bearing snippet takes its hit with it');
   assert.match(result.content, /^1 match/, 'the count is ours, after filtering');
 });
 
