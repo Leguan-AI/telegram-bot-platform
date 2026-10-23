@@ -9,6 +9,12 @@ import {
   type CustomToolDefinition,
   type ModelProvider,
 } from './model';
+import {
+  ANSWER_DEADLINE_MS,
+  FINALISE_RESERVE_MS,
+  startAnswerDeadline,
+  type Deadline,
+} from './answerBudget';
 import { resolveRepoScope, type RepoScope } from './repoScope';
 import {
   REPO_GROUNDING,
@@ -403,6 +409,19 @@ const WEB_SEARCH_GROUNDING = `WEB SEARCH GUIDANCE:
 /**
  * Generate an answer. Internally builds the system prompt, calls the model provider, and returns answer.
  */
+/**
+ * What the user gets when the deadline arrives before any answer does. It names the cause,
+ * because "something went wrong" sends someone looking for a fault that is not there.
+ */
+const ANSWER_OUT_OF_TIME =
+  'I ran out of time working that one out. Try asking again, or narrow the question — a particular file or directory is much quicker than a whole repository.';
+
+/** A cancelled request, under either of the names a fetch abort arrives with. */
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 export async function answerQuestion(input: {
   entityId: string;
   groupId: string;
@@ -418,8 +437,15 @@ export async function answerQuestion(input: {
    * without it.
    */
   onStatus?: (text: string) => Promise<void>;
+  /**
+   * When this answer must be finished, fixed by the route at the start of the request
+   * (#37 review B1). Everything that can be slow — the GitHub reads, the model hops — is
+   * measured against it rather than against its own clock.
+   */
+  deadline?: Deadline;
 }): Promise<{ text: string; entities: TelegramMessageEntity[] }> {
   const isolationScopeId = resolveIsolationScopeId(input.groupId);
+  const deadline = input.deadline ?? startAnswerDeadline();
 
   // Load the project documentation and recent transcript context
   const { contextDocs, recentConversation } = await buildContext(
@@ -436,6 +462,7 @@ export async function answerQuestion(input: {
       entityId: input.entityId,
       groupId: input.groupId,
       telegramThreadId: input.threadId,
+      deadline,
     });
   } catch (err) {
     console.error('Could not resolve the repository scope; answering without repository tools:', err);
@@ -480,7 +507,21 @@ ${input.question}`;
 
   // No repositories to read: the single call this has always been.
   if (tools.length === 0 || !scope || scope.installationId === null) {
-    const result = await provider.callModel(request);
+    let result: CallModelResult;
+    try {
+      result = await provider.callModel({
+        ...request,
+        // Even the single call is bounded: it is the whole answer, and the route's limit
+        // is the only thing behind it otherwise.
+        signal: deadline.signal(ANSWER_DEADLINE_MS),
+      });
+    } catch (err) {
+      if (!isTimeoutError(err)) throw err;
+      // Out of time, not broken. The route's mapError would say "something went wrong",
+      // which sends someone looking for a fault that is not there.
+      console.warn('Answer cancelled at the deadline before any text existed.');
+      return renderModelOutput(ANSWER_OUT_OF_TIME, provider.outputFormat);
+    }
 
     await logModelCall({
       entityId: input.entityId,
@@ -491,6 +532,10 @@ ${input.question}`;
       result,
       providerName: provider.name,
       isolationScopeId,
+      // An answer id and hop 0 here too (#37 review S2), so summing per answer is one
+      // query over every answer rather than one shape for each path.
+      answerId: randomUUID(),
+      hopIndex: 0,
     });
 
     const rendered = renderModelOutput(result.text, provider.outputFormat);
@@ -499,6 +544,7 @@ ${input.question}`;
 
   return answerWithRepoTools({
     ...input,
+    deadline,
     installationId: scope.installationId,
     repos,
     tools,
@@ -519,6 +565,7 @@ async function answerWithRepoTools(input: {
   threadId: bigint | number | string | null;
   botId?: string | null;
   onStatus?: (text: string) => Promise<void>;
+  deadline: Deadline;
   installationId: number;
   repos: ScopedRepoRef[];
   /** Built once by the caller: the same definitions must go out on every call (§7). */
@@ -532,6 +579,7 @@ async function answerWithRepoTools(input: {
   const session = new RepoToolSession({
     installationId: input.installationId,
     repos,
+    deadline: input.deadline,
   });
 
   // Which tools ran in which hop, for the per-hop ledger rows (§8). Paths only — never
@@ -550,6 +598,10 @@ async function answerWithRepoTools(input: {
     provider,
     request: input.request,
     tools,
+    // The hops answer to the request's deadline, not to a budget of their own: the scope
+    // resolution and context build above have already spent some of it.
+    deadlineAt: input.deadline.at,
+    finaliseMs: FINALISE_RESERVE_MS,
     runTool: async (name, args) => {
       const before = session.getReads().length;
       const result = await session.run(name, args);
@@ -598,10 +650,7 @@ async function answerWithRepoTools(input: {
   if (outcome.text.trim() === '') {
     // The loop ran out of time before any text existed. Saying so beats an empty bubble.
     console.warn(`Tool-loop answer ${answerId} produced no text (${outcome.stoppedBecause}).`);
-    return renderModelOutput(
-      'I ran out of time working through the repository for that one. Try asking again, or narrow the question to a particular file or directory.',
-      provider.outputFormat
-    );
+    return renderModelOutput(ANSWER_OUT_OF_TIME, provider.outputFormat);
   }
 
   const rendered = renderModelOutput(outcome.text, provider.outputFormat);

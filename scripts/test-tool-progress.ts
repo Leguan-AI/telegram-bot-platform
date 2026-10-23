@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'assert';
 
-import { formatToolProgress } from '../lib/toolProgress';
+import { formatToolProgress, stripInvisible } from '../lib/toolProgress';
 import { matchRepoName, type ScopedRepoRef } from '../lib/repoToolsTypes';
 
 const SHANNON: ScopedRepoRef = {
@@ -168,4 +168,50 @@ test('parallel calls add a count rather than more lines', () => {
 test('nothing to say returns null, so the caller leaves the status alone', () => {
   assert.strictEqual(formatToolProgress([], [SHANNON]), null);
   assert.strictEqual(formatToolProgress([call('web_search', { q: 'x' })], [SHANNON]), null);
+});
+
+// ---------------------------------------------------------------------------
+// Invisible characters (#37 review S1)
+// ---------------------------------------------------------------------------
+
+test('every invisible class is stripped, tag characters included', () => {
+  const cases: Array<[string, string]> = [
+    ['zero width space', '\u200b'],
+    ['zero width non-joiner', '\u200c'],
+    ['left-to-right mark', '\u200e'],
+    ['word joiner', '\u2060'],
+    ['invisible times', '\u2062'],
+    ['soft hyphen', '\u00ad'],
+    ['arabic letter mark', '\u061c'],
+    ['mongolian vowel separator', '\u180e'],
+    ['left-to-right embedding', '\u202a'],
+    ['right-to-left override', '\u202e'],
+    ['first strong isolate', '\u2068'],
+    ['byte order mark', '\ufeff'],
+    // The ASCII-smuggling block: an invisible copy of printable ASCII, which a model
+    // reads and a person does not. "TAG LATIN SMALL LETTER A" and the tag space.
+    ['tag letter a', '\u{E0061}'],
+    ['tag space', '\u{E0020}'],
+    ['language tag', '\u{E0001}'],
+  ];
+
+  for (const [label, char] of cases) {
+    assert.strictEqual(stripInvisible(`a${char}b`), 'ab', label);
+  }
+});
+
+test('ordinary text, including emoji and accents, is untouched', () => {
+  for (const value of ['src/auth.ts', 'héllo wörld', '📖 Reading', 'a\tb', 'ü/ß/日本語']) {
+    assert.strictEqual(stripInvisible(value), value, value);
+  }
+});
+
+test('a path smuggling instructions in tag characters shows none of them', () => {
+  // Spelled out: the hidden text is "rm" in tag characters, which the model would read.
+  const hidden = `\u{E0072}\u{E006D}`;
+  const line = formatToolProgress(
+    [{ name: 'read_file', input: { path: `src/auth${hidden}.ts` } }],
+    [{ repoId: 1, fullName: 'Leguan-AI/contributor-shannon', defaultBranch: 'main' }]
+  );
+  assert.strictEqual(line, '📖 Reading contributor-shannon/src/auth.ts…');
 });

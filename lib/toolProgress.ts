@@ -35,10 +35,23 @@ export interface ProgressCall {
 const MAX_PATH_CHARS = 54;
 
 /**
- * Bidi overrides and zero-width characters: legal in a filename, and invisible or
- * line-reordering when rendered. `src/\u202egnp.exe` reads as `src/exe.png` with one of these.
+ * Characters that are invisible to a person and meaningful to a model, or that reorder the
+ * text around them. Three groups:
+ *
+ *   * **bidi controls** (\u202a–\u202e, \u2066–\u2069, \u061c): `src/\u202egnp.exe` renders as
+ *     `src/exe.png`;
+ *   * **zero-width and invisible spacing** (\u200b–\u200f, \u2060–\u2064, \u00ad, \u180e,
+ *     \ufeff): present in the string, absent from the screen;
+ *   * **Unicode tag characters** (\ue0000–\ue007f): a full invisible copy of ASCII, and the
+ *     known vector for hiding instructions in text a model will read — which is exactly
+ *     what a repository description is, once it reaches a system prompt (#37 review S1).
+ *
+ * The `u` flag is required: the tag block is astral, and without it the range is read as
+ * surrogate halves.
  */
-const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const INVISIBLE =
+  /[\u00ad\u061c\u180e\u200b-\u200f\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff]|[\u{E0000}-\u{E007F}]/gu;
+
 /**
  * Drops them. Exported because the provenance footer (§9) shows repository paths too, and
  * display hygiene applied in one place and forgotten in the other is how a line that

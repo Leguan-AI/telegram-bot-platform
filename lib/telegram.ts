@@ -1,5 +1,6 @@
 import { BOT_COMMANDS, type BotCommand } from './commands';
 import { htmlToFormattable } from '@gramio/format/html';
+import { TELEGRAM_CALL_TIMEOUT_MS } from './answerBudget';
 
 export type TelegramMessageEntity = ReturnType<typeof htmlToFormattable>['entities'][number];
 
@@ -19,13 +20,16 @@ async function callTelegramApi(
   body: Record<string, any>
 ): Promise<any> {
   const url = `https://api.telegram.org/bot${token}/${method}`;
-  
+
+  // Bounded, but deliberately not by the answer's deadline: the final send happens after
+  // that deadline by design, and that send is the answer (#37 review B1).
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(TELEGRAM_CALL_TIMEOUT_MS),
   });
 
   if (!res.ok) {

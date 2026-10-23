@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { waitUntil } from '@vercel/functions';
 
 /**
- * An answer that reads repositories runs a tool loop (#21 §7): a 90-second budget, plus
- * the final answer-only call's own allowance, plus the Telegram and database calls around
- * them. The loop cancels its own model calls at the deadline, but only this bound stops
- * the function being killed mid-answer — with the status message left as the last thing
- * the user saw.
+ * An answer that reads repositories runs a tool loop (#21 §7), and every slow step in it
+ * answers to one deadline fixed at the start of the request — see lib/answerBudget.ts,
+ * which also holds the arithmetic this number has to cover. Kept as a literal because
+ * Next requires route segment config to be statically analysable; test-answer-budget.ts
+ * asserts it still matches ANSWER_MAX_DURATION_SECONDS.
  */
 export const maxDuration = 140;
 import { sql, withTenantContext, withBotContext } from '@/lib/supabase';
@@ -54,6 +54,7 @@ import {
   NOTICE_ON_JOIN,
 } from '@/lib/privacy';
 import { rejectUnlessValidTelegramSecret } from '@/lib/webhookAuth';
+import { startAnswerDeadline } from '@/lib/answerBudget';
 import {
   buildContextRepoLine,
   buildRepoListing,
@@ -91,6 +92,11 @@ interface RouteParams {
 }
 
 export async function POST(req: NextRequest, { params }: RouteParams) {
+  // Fixed here, before any work: everything slow downstream measures itself against this
+  // one instant, so resolving the bot, building context and reading repositories all come
+  // out of the same allowance rather than each getting a fresh one (#37 review B1).
+  const deadline = startAnswerDeadline();
+
   try {
     const { botSlug } = await params;
 
@@ -1323,6 +1329,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
                 replyToMessageId: message.message_id,
                 initialStatus: STATUS_QUESTION,
                 work: async (updateStatus) => answerQuestion({
+                  deadline,
                   entityId: entity.id,
                   groupId: group.id,
                   threadId: threadId,

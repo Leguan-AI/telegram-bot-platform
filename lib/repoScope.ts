@@ -11,6 +11,7 @@
  * only narrow, which the repo_links trigger enforces on write.
  */
 
+import { GITHUB_CALL_TIMEOUT_MS, type Deadline } from '@/lib/answerBudget';
 import { withTenantContext } from '@/lib/supabase';
 import {
   METADATA_ONLY_PERMISSIONS,
@@ -49,6 +50,12 @@ export async function resolveRepoScope(input: {
   entityId: string;
   groupId: string;
   telegramThreadId: bigint | number | string | null;
+  /**
+   * The answer's deadline, where the caller has one (#37 review B1). The name lookup is
+   * two GitHub calls and the listing pages, so without a bound it can eat an answer's
+   * whole allowance before the first model call.
+   */
+  deadline?: Deadline;
 }): Promise<RepoScope> {
   const threadIdStr =
     input.telegramThreadId !== null && input.telegramThreadId !== undefined
@@ -114,7 +121,7 @@ export async function resolveRepoScope(input: {
     };
   }
 
-  const found = await lookupRepos(Number(connection.installation_id), repoIds);
+  const found = await lookupRepos(Number(connection.installation_id), repoIds, input.deadline);
 
   return {
     status,
@@ -161,16 +168,25 @@ interface LookedUpRepo {
  * token cannot read a line of code. An empty map means GitHub did not answer; the caller
  * degrades to ids rather than pretending the repositories are not there.
  */
-async function lookupRepos(installationId: number, repoIds: number[]): Promise<Map<number, LookedUpRepo>> {
+async function lookupRepos(
+  installationId: number,
+  repoIds: number[],
+  deadline?: Deadline
+): Promise<Map<number, LookedUpRepo>> {
   const found = new Map<number, LookedUpRepo>();
   if (!canMintInstallationTokens()) return found;
+
+  // Whichever is shorter: one call's timeout, or what is left of the answer. A timeout
+  // here degrades to ids and no tools, which is the fail-closed direction.
+  const signal = deadline?.signal(GITHUB_CALL_TIMEOUT_MS);
 
   try {
     const token = await mintInstallationToken({
       installationId,
       permissions: { ...METADATA_ONLY_PERMISSIONS },
+      signal,
     });
-    for (const repo of await listInstallationRepositories(token.token)) {
+    for (const repo of await listInstallationRepositories(token.token, signal)) {
       if (repoIds.includes(repo.id)) {
         found.set(repo.id, {
           fullName: repo.fullName,

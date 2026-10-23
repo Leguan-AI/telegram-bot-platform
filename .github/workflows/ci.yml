@@ -27,6 +27,7 @@ jobs:
       - name: Unit tests
         run: >
           npx tsx --test
+          scripts/test-answer-budget.ts
           scripts/test-context-file.ts
           scripts/test-github-app-token.ts
           scripts/test-github-owner-check.ts

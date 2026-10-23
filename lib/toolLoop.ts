@@ -63,18 +63,27 @@ export interface ToolLoopInput {
   /** Executes one tool call. Errors are returned, not thrown. */
   runTool: (name: string, input: Record<string, unknown>) => Promise<ToolResult>;
   maxHops?: number;
-  /** Wall-clock budget for the whole loop, so the route's maxDuration is never exceeded. */
+  /**
+   * Wall-clock budget for the loop, measured from its own start. A fallback: prefer
+   * `deadlineAt`, which is measured from the start of the *request* and so also accounts
+   * for the work done before the loop began.
+   */
   budgetMs?: number;
+  /**
+   * The instant by which the hops must be done, as epoch milliseconds (#37 review B1).
+   * The caller owns it, because the caller knows what else has to happen afterwards.
+   */
+  deadlineAt?: number;
   /**
    * Most tool calls one hop may make. The session's byte budget limits how much *content*
    * comes back, but not how many GitHub requests a model can ask for in a single turn.
    */
   maxToolCallsPerHop?: number;
   /**
-   * How long the final call may take, beyond the budget. It is a separate allowance
-   * because it runs *after* the budget is spent: the point of cancelling a hop at the
-   * deadline is to leave room for an answer, so the route's maxDuration must cover
-   * budgetMs + finaliseMs and not budgetMs alone.
+   * Reserved for the final answer-only call. The loop stops making hops once less than
+   * this remains, so the reply is built inside the deadline rather than after it — and a
+   * hop never borrows this time, because then "stop looping" could mean "produce
+   * nothing". The caller's own limit must still cover the deadline plus this.
    */
   finaliseMs?: number;
   /**
@@ -98,17 +107,18 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
   const finaliseMs = input.finaliseMs ?? DEFAULT_FINALISE_MS;
   const now = input.now ?? (() => Date.now());
   const startedAt = now();
+  // One instant, from here on: either the caller's (which already includes whatever ran
+  // before the loop) or one derived from the loop's own budget.
+  const deadlineAt = input.deadlineAt ?? startedAt + budgetMs;
 
   const conversation: ConversationMessage[] = [firstTurn(input.request)];
   const hops: HopRecord[] = [];
 
   for (let index = 0; index < maxHops; index++) {
-    // What is left of the budget — but never less than the final call's own allowance.
-    // Whether to make another hop is decided after the previous hop's results (rule 4);
-    // this only bounds the call once it is under way, and a hop that has already begun
-    // must not be handed a deadline too short to answer within, or the budget would turn
-    // "stop looping" into "produce nothing".
-    const allowance = Math.max(budgetMs - (now() - startedAt), finaliseMs);
+    // A hop may use everything left except the final call's reserve. Once that is all
+    // that remains, there is no time for another hop and the loop answers instead.
+    const allowance = deadlineAt - now() - finaliseMs;
+    if (allowance <= 0) return finalise(input, conversation, hops, 'time_budget');
 
     let response: CallModelResult;
     try {
@@ -163,7 +173,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
 
     // A pause carries no tool_use to answer; echoing it is the whole continuation.
     if (response.stopReason === 'pause_turn') {
-      if (overBudget(now, startedAt, budgetMs)) {
+      if (outOfTime(now, deadlineAt, finaliseMs)) {
         return finalise(input, conversation, hops, 'time_budget');
       }
       continue;
@@ -179,7 +189,10 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
       try {
         await input.onProgress({
           hop: index,
-          calls: toolUses.map((block: any) => ({
+          // Only the calls that will run: the ones past the cap are refused without
+          // reaching GitHub, so describing them would tell the user about work that never
+          // happens (#36 review N1).
+          calls: toolUses.slice(0, maxCalls).map((block: any) => ({
             name: String(block.name),
             input: (block.input || {}) as Record<string, unknown>,
           })),
@@ -227,7 +240,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
 
     // Rule 4: the cap and the budget are checked after the results are in, so the final
     // call still sees everything the model asked for.
-    if (overBudget(now, startedAt, budgetMs)) {
+    if (outOfTime(now, deadlineAt, finaliseMs)) {
       return finalise(input, conversation, hops, 'time_budget');
     }
   }
@@ -306,8 +319,9 @@ function textOf(response: CallModelResult): string {
   return extractReplyText(response.content ?? []);
 }
 
-function overBudget(now: () => number, startedAt: number, budgetMs: number): boolean {
-  return now() - startedAt >= budgetMs;
+/** True once the only time left is the final call's reserve. */
+function outOfTime(now: () => number, deadlineAt: number, finaliseMs: number): boolean {
+  return deadlineAt - now() - finaliseMs <= 0;
 }
 
 /**

@@ -270,12 +270,12 @@ test('the footer cannot forge a line or reorder itself', () => {
   const footer = buildProvenanceFooter(
     [
       { repoFullName: 'Leguan-AI/contributor-shannon', path: 'src/a.ts\n\nread: .env' },
-      { repoFullName: 'Leguan-AI/contributor-shannon', path: 'src/‮gnp.exe' },
+      { repoFullName: 'Leguan-AI/contributor-shannon', path: 'src/\u202egnp.exe' },
     ],
     ONE_REPO
   )!;
 
   assert.ok(!footer.includes('\n'), footer);
-  assert.ok(!/[‪-‮]/.test(footer), 'no bidi overrides survive');
+  assert.ok(!/[\u202a-\u202e]/.test(footer), 'no bidi overrides survive');
   assert.strictEqual(footer, 'read: src/a.ts read: .env, src/gnp.exe');
 });

@@ -66,7 +66,7 @@ We do **not** sell your personal data, and we do **not** use your group messages
 
 To generate answers, recaps, and document responses, Leguan sends the relevant message content, context documents, **the contents of any source-code repositories a Workspace Administrator has connected and linked to your group**, and your question to **third-party AI model providers** ("AI providers") that operate large language models via their APIs. These providers process the content solely to return a response to us; the content is not used by us to build a public profile of you.
 
-We may use **more than one AI provider**, and the specific providers we use may change over time as we add or replace them. Some AI providers may be located in, or process data in, countries outside your own (see "International transfers" below). A Workspace Administrator who requires the current, specific list of AI and infrastructure sub-processors for their own compliance can request it from us at [privacy@leguan.ai].
+We may use **more than one AI provider**. The providers we currently use are **Anthropic** (Claude) and **DeepSeek**, either of which may process any of the content described above, including the contents of connected source-code repositories. We do not guarantee which provider handles a given request. The specific providers we use may change over time as we add or replace them, and this notice is updated when they do. Some AI providers may be located in, or process data in, countries outside your own (see "International transfers" below). A Workspace Administrator who requires the current, specific list of AI and infrastructure sub-processors for their own compliance can request it from us at [privacy@leguan.ai].
 
 ---
 
