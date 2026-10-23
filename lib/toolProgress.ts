@@ -36,9 +36,17 @@ const MAX_PATH_CHARS = 54;
 
 /**
  * Bidi overrides and zero-width characters: legal in a filename, and invisible or
- * line-reordering when rendered. `src/‮gnp.exe` reads as `src/exe.png` with one of these.
+ * line-reordering when rendered. `src/\u202egnp.exe` reads as `src/exe.png` with one of these.
  */
-const INVISIBLE = /[​-‏‪-‮⁦-⁩﻿]/g;
+const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+/**
+ * Drops them. Exported because the provenance footer (§9) shows repository paths too, and
+ * display hygiene applied in one place and forgotten in the other is how a line that
+ * reorders itself reaches a chat.
+ */
+export function stripInvisible(value: string): string {
+  return value.replace(INVISIBLE, '');
+}
 
 /**
  * The status line for a hop, or null when there is nothing worth saying — an unrecognised
@@ -106,7 +114,7 @@ function pathOf(raw: unknown): string | null {
   const normalized = normalizeRepoPath(raw);
   if (!normalized.ok || normalized.path === '') return null;
 
-  const cleaned = normalized.path.replace(INVISIBLE, '');
+  const cleaned = stripInvisible(normalized.path);
   if (cleaned === '') return null;
 
   return shorten(cleaned);

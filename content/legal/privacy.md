@@ -36,6 +36,7 @@ Depending on how you interact with Leguan, we process:
 - **Group messages and content.** When the bot is present in a group (with Telegram "privacy mode" off, which the service requires to function), it receives and stores the text of messages sent in that group so it can provide features such as question-answering, recaps, and saved context. This may include any personal data that group members choose to include in their messages.
 - **Telegram identifiers and metadata.** Associated with messages, we process identifiers such as your Telegram user ID, username or display name, the group/chat ID, and the topic/thread and timestamp of a message.
 - **Documents you share with the bot.** If a group member sends or references a document for the bot to read, its contents are processed to generate a response.
+- **Connected source-code repositories.** A Workspace Administrator can connect a GitHub account and link specific private repositories to a group. The bot then reads those repositories to answer questions about the code, which means **every member of that group can obtain their contents by asking the bot**. Files that appear to hold credentials (for example `.env` files, private keys and credential stores) are blocked by filename and are not read. Repository contents are read on demand and held only for the duration of the answer; they are not stored as part of your group's data. Whoever owns the GitHub account controls which repositories are shared and can revoke access at any time from GitHub's own installation settings.
 - **Dashboard account data.** If you use the management dashboard, we process your email address and authentication data, and records of the workspaces and groups you manage.
 - **Technical and security data.** Standard operational logs (for example, event and error logs) used to run, debug, and secure the service.
 
@@ -63,7 +64,7 @@ We do **not** sell your personal data, and we do **not** use your group messages
 
 ## 4. AI model providers and how your messages are used
 
-To generate answers, recaps, and document responses, Leguan sends the relevant message content, context documents, and your question to **third-party AI model providers** ("AI providers") that operate large language models via their APIs. These providers process the content solely to return a response to us; the content is not used by us to build a public profile of you.
+To generate answers, recaps, and document responses, Leguan sends the relevant message content, context documents, **the contents of any source-code repositories a Workspace Administrator has connected and linked to your group**, and your question to **third-party AI model providers** ("AI providers") that operate large language models via their APIs. These providers process the content solely to return a response to us; the content is not used by us to build a public profile of you.
 
 We may use **more than one AI provider**, and the specific providers we use may change over time as we add or replace them. Some AI providers may be located in, or process data in, countries outside your own (see "International transfers" below). A Workspace Administrator who requires the current, specific list of AI and infrastructure sub-processors for their own compliance can request it from us at [privacy@leguan.ai].
 

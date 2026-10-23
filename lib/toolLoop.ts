@@ -42,6 +42,8 @@ export interface HopRecord {
   toolCalls: string[];
   usage: CallModelResult['usage'];
   thinkingTokens?: number;
+  /** Provider-side web searches made in this hop, for the per-hop ledger rows (§8). */
+  webSearchRequests?: number;
   model: string;
   requestId: string | null;
 }
@@ -69,6 +71,13 @@ export interface ToolLoopInput {
    */
   maxToolCallsPerHop?: number;
   /**
+   * How long the final call may take, beyond the budget. It is a separate allowance
+   * because it runs *after* the budget is spent: the point of cancelling a hop at the
+   * deadline is to leave room for an answer, so the route's maxDuration must cover
+   * budgetMs + finaliseMs and not budgetMs alone.
+   */
+  finaliseMs?: number;
+  /**
    * Called before each hop's tools run, so a caller can tell the user what is happening —
    * 90 seconds is a long time to watch a typing indicator. `input` is model-supplied: it
    * must be normalised and escaped before it is shown to anyone.
@@ -80,11 +89,13 @@ export interface ToolLoopInput {
 const DEFAULT_MAX_HOPS = 6;
 const DEFAULT_BUDGET_MS = 90_000;
 const DEFAULT_MAX_TOOL_CALLS_PER_HOP = 8;
+const DEFAULT_FINALISE_MS = 20_000;
 
 export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome> {
   const maxHops = input.maxHops ?? DEFAULT_MAX_HOPS;
   const budgetMs = input.budgetMs ?? DEFAULT_BUDGET_MS;
   const maxCalls = input.maxToolCallsPerHop ?? DEFAULT_MAX_TOOL_CALLS_PER_HOP;
+  const finaliseMs = input.finaliseMs ?? DEFAULT_FINALISE_MS;
   const now = input.now ?? (() => Date.now());
   const startedAt = now();
 
@@ -92,11 +103,31 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
   const hops: HopRecord[] = [];
 
   for (let index = 0; index < maxHops; index++) {
-    const response = await input.provider.callModel({
-      ...input.request,
-      tools: input.tools,
-      conversation,
-    });
+    // What is left of the budget — but never less than the final call's own allowance.
+    // Whether to make another hop is decided after the previous hop's results (rule 4);
+    // this only bounds the call once it is under way, and a hop that has already begun
+    // must not be handed a deadline too short to answer within, or the budget would turn
+    // "stop looping" into "produce nothing".
+    const allowance = Math.max(budgetMs - (now() - startedAt), finaliseMs);
+
+    let response: CallModelResult;
+    try {
+      response = await input.provider.callModel({
+        ...input.request,
+        tools: input.tools,
+        conversation,
+        // Cancelled at the deadline rather than waited out. Without this the budget only
+        // stops the loop *between* hops, so one slow call could run past the route's
+        // maxDuration and take the answer, not just the hop, down with it.
+        signal: deadlineSignal(allowance),
+      });
+    } catch (err) {
+      if (!isAbort(err)) throw err;
+      // The hop was cut off mid-flight, so `conversation` still ends with tool results
+      // (or the question) and is a valid turn to answer from.
+      console.warn(`Tool loop: hop ${index} cancelled at the time budget; finalising.`);
+      return finalise(input, conversation, hops, 'time_budget');
+    }
 
     const content = response.content ?? [];
     const toolUses = content.filter((block: any) => block?.type === 'tool_use');
@@ -107,6 +138,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopOutcome
       toolCalls: toolUses.map((block: any) => String(block.name)),
       usage: response.usage,
       thinkingTokens: response.thinkingTokens,
+      webSearchRequests: response.webSearchRequests,
       model: response.model,
       requestId: response.requestId,
     });
@@ -213,15 +245,26 @@ async function finalise(
   hops: HopRecord[],
   stoppedBecause: 'hop_cap' | 'time_budget' | 'truncated_turn'
 ): Promise<ToolLoopOutcome> {
-  const response = await input.provider.callModel({
-    ...input.request,
-    // The SAME tools, with tool_choice none. Both providers accept the call with `tools`
-    // omitted — probed, see scripts/probe-tool-choice-none.ts — but omitting them changes
-    // the cached prefix, and this is the call with the most context behind it.
-    tools: input.tools,
-    toolChoice: { type: 'none' },
-    conversation,
-  });
+  let response: CallModelResult;
+  try {
+    response = await input.provider.callModel({
+      ...input.request,
+      // The SAME tools, with tool_choice none. Both providers accept the call with `tools`
+      // omitted — probed, see scripts/probe-tool-choice-none.ts — but omitting them changes
+      // the cached prefix, and this is the call with the most context behind it.
+      tools: input.tools,
+      toolChoice: { type: 'none' },
+      conversation,
+      // Its own allowance, started now: the budget this call follows is already spent.
+      signal: deadlineSignal(input.finaliseMs ?? DEFAULT_FINALISE_MS),
+    });
+  } catch (err) {
+    if (!isAbort(err)) throw err;
+    // Nothing left to ask with. The caller decides what to say; it must not be a throw,
+    // because the hops are worth logging either way.
+    console.warn('Tool loop: the final call was cancelled; returning no text.');
+    return { text: '', hops, stoppedBecause };
+  }
 
   hops.push({
     index: hops.length,
@@ -229,6 +272,7 @@ async function finalise(
     toolCalls: [],
     usage: response.usage,
     thinkingTokens: response.thinkingTokens,
+    webSearchRequests: response.webSearchRequests,
     model: response.model,
     requestId: response.requestId,
   });
@@ -264,4 +308,21 @@ function textOf(response: CallModelResult): string {
 
 function overBudget(now: () => number, startedAt: number, budgetMs: number): boolean {
   return now() - startedAt >= budgetMs;
+}
+
+/**
+ * A signal that fires after `ms`. AbortSignal.timeout rather than a setTimeout we would
+ * have to clear: an uncleared timer holds the function open past the answer.
+ */
+function deadlineSignal(ms: number): AbortSignal {
+  return AbortSignal.timeout(Math.max(1, Math.floor(ms)));
+}
+
+/**
+ * Both shapes a cancelled call arrives as: the DOM-style AbortError, and the TimeoutError
+ * that AbortSignal.timeout produces.
+ */
+function isAbort(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'AbortError' || name === 'TimeoutError';
 }

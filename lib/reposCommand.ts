@@ -23,6 +23,14 @@ export interface ScopedRepo {
   shortName: string;
   /** True when this repo is in scope because the topic is pinned to it. */
   pinned: boolean;
+  /**
+   * The branch the tools read (§6 follows the default branch only), and GitHub's own
+   * one-line description, used for the §5 prompt descriptor. Both come from the live
+   * installation listing, so both are absent when that lookup failed — which is also
+   * when the repository tools stay switched off.
+   */
+  defaultBranch?: string;
+  description?: string | null;
 }
 
 /**

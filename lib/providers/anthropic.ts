@@ -80,6 +80,7 @@ export class AnthropicProvider implements ModelProvider {
         },
         {
           headers,
+          ...(input.signal ? { signal: input.signal } : {}),
         }
       );
 

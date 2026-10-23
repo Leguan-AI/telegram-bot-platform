@@ -74,7 +74,10 @@ export class DeepSeekProvider implements ModelProvider {
         ];
       }
 
-      const response = await this.anthropic.messages.create(createParams);
+      const response = await this.anthropic.messages.create(
+        createParams,
+        input.signal ? { signal: input.signal } : undefined
+      );
 
       // DeepSeek responses might include thinking, tool use, and tool result blocks.
       // Use the shared extractReplyText helper to safely extract the final answer.
@@ -99,6 +102,10 @@ export class DeepSeekProvider implements ModelProvider {
         webSearchRequests,
       };
     } catch (error: any) {
+      // An abort is the caller cancelling on purpose, not a provider failure: rethrow it
+      // unwrapped so the tool loop can recognise it. Wrapping it in a new Error would
+      // lose the name the loop branches on.
+      if (error?.name === 'AbortError' || input.signal?.aborted) throw error;
       console.error('DeepSeek API call failed:', error);
       throw new Error(`Failed to generate answer from DeepSeek: ${error.message}`);
     }

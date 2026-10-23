@@ -91,7 +91,7 @@ test('traversal and absolute paths are refused', () => {
 
 test('invisible and line-reordering characters are stripped', () => {
   const line = formatToolProgress(
-    [call('read_file', { path: 'src/‮gnp.exe' })],
+    [call('read_file', { path: 'src/\u202egnp.exe' })],
     [SHANNON]
   );
   assert.strictEqual(line, '📖 Reading contributor-shannon/src/gnp.exe…');

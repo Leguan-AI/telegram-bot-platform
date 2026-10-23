@@ -459,3 +459,89 @@ test('a failing progress callback does not cost the answer', async () => {
 
   assert.strictEqual(outcome.text, 'still answered');
 });
+
+// ---------------------------------------------------------------------------
+// Cancellation: the budget cuts a call off mid-flight, not only between hops
+// ---------------------------------------------------------------------------
+
+/** What a provider throws when its AbortSignal fires. */
+function abortError(name: 'AbortError' | 'TimeoutError'): Error {
+  const err = new Error('aborted');
+  err.name = name;
+  return err;
+}
+
+test('every call carries a deadline signal', async () => {
+  const { provider, seen } = scripted([
+    reply({ stopReason: 'end_turn', text: 'done', content: [{ type: 'text', text: 'done' }] }),
+  ]);
+  // JSON round-tripping in `scripted` drops the signal, so this reads it directly.
+  let captured: AbortSignal | undefined;
+  const wrapped = {
+    ...provider,
+    callModel: async (input: CallModelInput) => {
+      captured = input.signal;
+      return provider.callModel(input);
+    },
+  };
+
+  await loop(wrapped, async () => ({ content: 'unused' }));
+
+  assert.ok(captured instanceof AbortSignal, 'the hop was given a signal');
+  assert.strictEqual(captured!.aborted, false, 'and it had not already fired');
+  assert.strictEqual(seen.length, 1);
+});
+
+for (const name of ['AbortError', 'TimeoutError'] as const) {
+  test(`a hop cancelled with ${name} still produces an answer`, async () => {
+    let calls = 0;
+    const provider: ModelProvider = {
+      name: 'anthropic',
+      outputFormat: 'markdown',
+      callModel: async () => {
+        calls++;
+        // The first call is cut off; the final one answers from the question alone.
+        if (calls === 1) throw abortError(name);
+        return reply({
+          stopReason: 'end_turn',
+          text: 'I ran out of time, but here is what I know',
+          content: [{ type: 'text', text: 'I ran out of time, but here is what I know' }],
+        });
+      },
+    };
+
+    const outcome = await loop(provider, async () => ({ content: 'unused' }));
+
+    assert.strictEqual(outcome.stoppedBecause, 'time_budget');
+    assert.strictEqual(outcome.text, 'I ran out of time, but here is what I know');
+    assert.strictEqual(calls, 2, 'the cancelled hop was followed by the final call');
+  });
+}
+
+test('a cancelled final call returns no text rather than throwing', async () => {
+  // The hops are still worth logging (§8), so this must not become an exception.
+  const provider: ModelProvider = {
+    name: 'anthropic',
+    outputFormat: 'markdown',
+    callModel: async () => {
+      throw abortError('TimeoutError');
+    },
+  };
+
+  const outcome = await loop(provider, async () => ({ content: 'unused' }));
+
+  assert.strictEqual(outcome.text, '');
+  assert.strictEqual(outcome.stoppedBecause, 'time_budget');
+});
+
+test('a provider failure that is not an abort still throws', async () => {
+  const provider: ModelProvider = {
+    name: 'anthropic',
+    outputFormat: 'markdown',
+    callModel: async () => {
+      throw new Error('500 from the provider');
+    },
+  };
+
+  await assert.rejects(() => loop(provider, async () => ({ content: 'unused' })), /500 from the provider/);
+});

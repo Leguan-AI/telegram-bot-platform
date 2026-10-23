@@ -94,6 +94,42 @@ export class RepoToolSession {
     }
   }
 
+  /**
+   * Dispatches one model-issued tool call.
+   *
+   * The arguments are whatever the model sent, so each field is checked for its type
+   * rather than cast: a `path` that arrives as a number or an object would otherwise
+   * reach normalizeRepoPath, which expects a string. An unknown tool name is answered,
+   * not thrown — the loop needs a tool_result for every tool_use.
+   */
+  async run(name: string, input: Record<string, unknown>): Promise<ToolResult> {
+    const repo = typeof input.repo === 'string' ? input.repo : undefined;
+
+    switch (name) {
+      case 'list_tree':
+        return this.listTree({
+          repo,
+          path: typeof input.path === 'string' ? input.path : undefined,
+          depth: typeof input.depth === 'number' && Number.isFinite(input.depth) ? input.depth : undefined,
+        });
+
+      case 'read_file':
+        if (typeof input.path !== 'string') {
+          return { content: 'read_file needs a `path`.', isError: true };
+        }
+        return this.readFile({ repo, path: input.path });
+
+      case 'search_code':
+        if (typeof input.query !== 'string') {
+          return { content: 'search_code needs a `query`.', isError: true };
+        }
+        return this.searchCode({ repo, query: input.query });
+
+      default:
+        return { content: `There is no tool called ${JSON.stringify(name)}.`, isError: true };
+    }
+  }
+
   /** Files actually read, for the provenance footer the server builds (§9). */
   getReads(): ReadRecord[] {
     return [...this.reads];
