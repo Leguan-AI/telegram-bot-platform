@@ -42,20 +42,10 @@ export function normalizeRepoPath(raw: string): NormalizedPath {
 
   let decoded = raw;
   for (let i = 0; i < 5; i++) {
-    let next: string;
-    try {
-      next = decodeURIComponent(decoded);
-    } catch {
-      // A malformed escape is not something to guess at. Note the cost: a real filename
-      // containing a stray `%`, such as `README (100%).md`, is refused and therefore
-      // invisible to the tools. That is deliberate — failing closed on anything we cannot
-      // decode is worth more than reaching an unusual filename — but it is a real gap, not
-      // an oversight. Falling back to the raw string would also be safe, since the
-      // traversal and control-character checks run on it either way.
-      return { ok: false, reason: 'invalid_path' };
-    }
+    const next = decodePercentEscapes(decoded);
     if (next === decoded) break;
     decoded = next;
+    // Still unwrapping after five passes is not a filename; it is someone hiding something.
     if (i === 4) return { ok: false, reason: 'invalid_path' };
   }
 
@@ -77,6 +67,29 @@ export function normalizeRepoPath(raw: string): NormalizedPath {
   if (segments.length === 0) return { ok: false, reason: 'invalid_path' };
 
   return { ok: true, path: segments.join('/') };
+}
+
+/**
+ * Decodes the percent-escapes a string actually has, and leaves alone what it does not.
+ *
+ * `decodeURIComponent` is all-or-nothing: one stray `%` and it throws for the whole
+ * string. Treating that as "invalid path" costs real files — `README (100%).md` would be
+ * unreadable *and* silently missing from every listing — while simply stopping at the
+ * throw costs something worse: `%2e%2e/%zz` would keep its encoded `..` and never be seen
+ * as traversal.
+ *
+ * So each maximal run of valid escapes is decoded on its own (a run, not a single escape,
+ * so multi-byte UTF-8 survives), and anything malformed stays literal. `%2e%2e/%zz`
+ * becomes `../%zz` and is refused; `README (100%).md` passes through untouched.
+ */
+function decodePercentEscapes(input: string): string {
+  return input.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
 }
 
 /** Converts one documented glob into an anchored, case-insensitive regex. */

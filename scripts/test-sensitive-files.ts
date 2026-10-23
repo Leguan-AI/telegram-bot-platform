@@ -50,8 +50,35 @@ test('percent-decoding repeats until stable, catching double encoding', () => {
   assert.deepStrictEqual(normalizeRepoPath('src/my%20file.ts'), { ok: true, path: 'src/my file.ts' });
 });
 
-test('malformed escapes are refused rather than guessed at', () => {
-  assert.deepStrictEqual(normalizeRepoPath('src/%zz'), { ok: false, reason: 'invalid_path' });
+// A sequence decodeURIComponent rejects is not an escape, so there is nothing further to
+// unwrap and the raw characters are checked as they stand. Refusing instead would make an
+// ordinary filename with a stray `%` unreadable AND silently absent from every listing.
+test('a filename containing a stray percent is usable, not refused', () => {
+  assert.deepStrictEqual(normalizeRepoPath('README (100%).md'), { ok: true, path: 'README (100%).md' });
+  assert.deepStrictEqual(normalizeRepoPath('docs/50%-off.html'), { ok: true, path: 'docs/50%-off.html' });
+  assert.deepStrictEqual(normalizeRepoPath('src/%zz'), { ok: true, path: 'src/%zz' });
+  assert.strictEqual(isNameBlocked('README (100%).md'), false, 'and it must not vanish from listings');
+});
+
+// The point of the fallback is that it gives nothing away: traversal decodes cleanly, so
+// it is still caught, and a malformed escape cannot smuggle it past.
+test('a stray percent cannot be used to hide traversal', () => {
+  assert.deepStrictEqual(normalizeRepoPath('%2e%2e/%zz'), { ok: false, reason: 'invalid_path' });
+  // `..%zz` is a literal (odd) filename, not a traversal segment, so it is allowed —
+  // what matters is that nothing decodes INTO `..`.
+  assert.deepStrictEqual(normalizeRepoPath('..%zz/secrets'), { ok: true, path: '..%zz/secrets' });
+  assert.deepStrictEqual(normalizeRepoPath('%zz/../etc'), { ok: false, reason: 'invalid_path' });
+  // And the literal path that results is harmless: it is a filename, not a traversal.
+  const literal = normalizeRepoPath('a%zzb/c.ts');
+  assert.deepStrictEqual(literal, { ok: true, path: 'a%zzb/c.ts' });
+});
+
+test('endless nesting is still refused', () => {
+  // %2525252e… keeps unwrapping; five passes is the limit.
+  assert.deepStrictEqual(normalizeRepoPath('%252525252e%252525252e/x'), {
+    ok: false,
+    reason: 'invalid_path',
+  });
 });
 
 test('absolute paths, backslashes and control characters are refused', () => {
