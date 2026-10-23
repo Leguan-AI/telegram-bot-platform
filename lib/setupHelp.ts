@@ -37,6 +37,11 @@ export const UNLINKED_NUDGE = `This group isn't linked to a workspace yet — se
  * are exactly the people who read /help.
  *
  * The provider names come from resolveProvider in lib/model.ts; change them together.
+ *
+ * The command list at the top mentions pinning as well as the Repositories section below,
+ * because that list is what people actually read: a reader who went through the whole of
+ * this still came away thinking pins were not offered when only the section mentioned
+ * them. Keep both.
  */
 export function buildLinkedHelp(botUsername: string): string {
   const mention = `@${escapeHtml(botUsername)}`;
@@ -46,7 +51,7 @@ export function buildLinkedHelp(botUsername: string): string {
     `• Use <code>/context</code> to see what documentation I'm answering from in this topic.\n` +
     `• Use <code>/push topic</code> or <code>/push group</code> as a <i>reply</i> to a message, or as the caption of an attached .txt/.md file, to save it as context for the topic or group (group admins only).\n` +
     `• Use <code>/recap [N]</code> to summarize the last N messages here (default 20).\n` +
-    `• Use <code>/repos</code> to see which code repositories I can read here.\n` +
+    `• Use <code>/repos</code> to see which code repositories I can read here — and, if you're a group admin, to limit a topic to certain ones.\n` +
     `• Use <code>/whoami</code> to show this chat's ids (useful for setup/diagnostics).\n` +
     `• Mention me <code>${mention} &lt;question&gt;</code> inside a topic to ask a question.\n\n` +
     `<b>📦 Repositories</b>\n` +
