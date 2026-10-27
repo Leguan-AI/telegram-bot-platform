@@ -8,9 +8,10 @@ import {
   GITHUB_CONNECT_DISCLOSURES,
   ALL_REPOS_WARNING,
   ALL_REPOS_SHARED_NOTE,
+  githubInstallationSettingsUrl,
 } from '@/lib/githubConnectUi';
 import '../../manage.css';
-import { ContextEditor, ContextDocTable, type ContextDoc } from './ContextEditor';
+import { ContextDocManager, type ContextDoc } from './ContextEditor';
 import { RepoLinkSection, type RepoLinkRow, type RepoOption } from './RepoLinkEditor';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'Agent Platform';
@@ -252,6 +253,14 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
    * GitHub, through a server route that holds the installation token) and the links
    * already saved (straight from the database as `authenticated`).
    */
+  /** Re-reads the installation's repositories after the admin changed them on GitHub. */
+  const handleRefreshRepos = async () => {
+    setGithubError('');
+    setGithubSuccess('');
+    await loadRepoData();
+    setGithubSuccess('Repository list refreshed from GitHub.');
+  };
+
   const loadRepoData = async () => {
     setRepoLoading(true);
     setRepoLoadError('');
@@ -623,23 +632,19 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                 </div>
               )}
               <p style={{ fontSize: '0.95rem' }}>
-                This document applies to <strong>every group</strong> linked to this entity. Write or upload the background
-                the bot should rely on: who you are, how things work, key terms. You can add more specific context to an
-                individual group from the Linked Groups tab.
+                These documents apply to <strong>every group</strong> linked to this entity. Write or upload the background
+                the bot should rely on: who you are, how things work, key terms. Add as many documents as you need, and
+                edit or remove any of them from the list below. More specific context for one group goes in the
+                Linked Groups tab.
               </p>
-              <ContextEditor
+              <ContextDocManager
                 key="entity-context"
                 entityId={entity.id}
                 groupId={null}
                 canEdit={canEditContext}
-                onSaved={refreshContextDocs}
+                docs={entityDocs}
+                onChanged={refreshContextDocs}
               />
-              {entityDocs.length > 0 && (
-                <div style={{ marginTop: '2rem' }}>
-                  <h3>Documents that apply to the whole entity</h3>
-                  <ContextDocTable docs={entityDocs} />
-                </div>
-              )}
             </div>
 
             <div className="card">
@@ -886,17 +891,14 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                                     <p style={{ fontSize: '0.9rem' }}>
                                       Applies only to this group, in addition to the entity-wide context.
                                     </p>
-                                    <ContextEditor
+                                    <ContextDocManager
                                       key={`group-context-${g.id}`}
                                       entityId={entity.id}
                                       groupId={g.id}
                                       canEdit={canEditContext}
-                                      onSaved={refreshContextDocs}
+                                      docs={docsForGroup}
+                                      onChanged={refreshContextDocs}
                                     />
-                                    <div style={{ marginTop: '2rem' }}>
-                                      <h3>Documents for this group</h3>
-                                      <ContextDocTable docs={docsForGroup} />
-                                    </div>
                                   </td>
                                 </tr>
                               )}
@@ -1070,16 +1072,56 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                     )}
 
                     {githubConnection.status !== 'pending_confirmation' && (
-                      <div style={{ marginTop: '1.5rem' }}>
-                        <button onClick={handleDisconnectGithub} className="btn btn-danger" disabled={githubBusy}>
-                          Disconnect GitHub
-                        </button>
-                        <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
-                          Disconnecting removes every repository link in this directory. The owner
-                          can also change the shared repositories, or remove the installation, on
-                          GitHub; the repository list above reflects that immediately.
-                        </p>
-                      </div>
+                      <>
+                        {/* Which repositories the installation contains is GitHub's to decide — the
+                            App cannot widen or narrow its own grant — so adding or removing one
+                            happens there, and we re-read the list when the admin comes back. */}
+                        <div style={{ marginTop: '1.5rem' }}>
+                          <h3 style={{ fontSize: '1rem', marginBottom: '0.35rem' }}>Shared repositories</h3>
+                          <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                            {githubConnection.repository_selection === 'all'
+                              ? `Every repository in ${githubConnection.account_login} is shared with this directory.`
+                              : `${repoOptions.length} repositor${repoOptions.length === 1 ? 'y is' : 'ies are'} shared with this directory.`}{' '}
+                            Adding or removing one is done on GitHub, by an owner of{' '}
+                            <strong>{githubConnection.account_login}</strong> — this app can read what
+                            was shared with it, never change it. Removing one there also removes every
+                            link to it here.
+                          </p>
+                          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginTop: '1rem' }}>
+                            <a
+                              href={githubInstallationSettingsUrl(githubConnection)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn btn-primary"
+                            >
+                              Add or remove repositories on GitHub ↗
+                            </a>
+                            <button
+                              onClick={handleRefreshRepos}
+                              className="btn btn-secondary"
+                              disabled={repoLoading || githubConnection.status !== 'active'}
+                            >
+                              {repoLoading ? 'Refreshing…' : 'Refresh the list'}
+                            </button>
+                          </div>
+                          <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
+                            Come back here afterwards and refresh — then choose below which groups may
+                            read each repository.
+                          </p>
+                        </div>
+
+                        <div style={{ marginTop: '2rem' }}>
+                          <button onClick={handleDisconnectGithub} className="btn btn-danger" disabled={githubBusy}>
+                            Disconnect GitHub
+                          </button>
+                          <p style={{ fontSize: '0.825rem', marginTop: '0.75rem', marginBottom: 0 }}>
+                            Disconnecting removes every repository link in this directory, and is only
+                            needed to connect a different GitHub account — to stop sharing one
+                            repository, remove it on GitHub instead. The installation itself stays on
+                            GitHub until its owner removes it there.
+                          </p>
+                        </div>
+                      </>
                     )}
                   </>
                 )}

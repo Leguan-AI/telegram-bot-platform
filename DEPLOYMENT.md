@@ -183,6 +183,7 @@ Current migrations that need a push beyond the init schema include:
 | `20260621000000_fix_rls_permissive.sql` | the PERMISSIVE policy fix described in A5 |
 | … | the Phase 1–3 management-plane, group-linking, thread-registry and logging migrations |
 | `20261022000000_dashboard_context_management.sql` | the dashboard context-document functions (`list_context_docs` / `get_managed_context` / `save_managed_context`) — see the dashboard content section below |
+| **`20261027000000_context_doc_crud.sql`** | **document-level context management: `create_context_doc`, `get_context_doc`, `update_context_doc`, `delete_context_doc` and the shared `normalize_context_doc_name`. Lets a scope hold several named documents and lets an admin edit or delete any of them — including ones added by `/push`. Required before the Entity Context panel and the per-group Manage panel in `/manage` can add or remove documents; without it both report the missing function on every save. Additive: the 20261022 functions and the documents they created are untouched.** |
 | **`20261022010000_github_app_connect.sql`** | **the GitHub App connect schema: `github_installations`, `repo_links`, `github_connect_invites` (RLS enabled *and* forced), the connect-token functions, and the trigger that keeps topic repo pins narrowing-only. Required before the GitHub tab in `/manage` works at all.** |
 | **`20261022020000_repo_link_management.sql`** | **repository linking: `list_repo_links` for the dashboard, `set_repo_links` and `get_github_connection_for_admin` for the server routes, and two more scope invariants on the `repo_links` trigger (no group from another entity, no thread from another group). Required before the picker in the GitHub tab can save.** |
 | **`20261023000000_github_webhooks.sql`** | **GitHub webhooks: the `github_webhook_deliveries` dedupe table and `resolve_github_installation`, the bootstrap resolver that replaces the dormant `resolve_entity_id_by_repo`. Required before `/api/webhooks/github` can do anything but reject.** |
@@ -741,14 +742,20 @@ returning id;
 ## B2. Seed content into the cache + manifest
 
 > **Preferred path: the dashboard.** In `/manage`, open the entity → **General Settings → Entity Context**
-> to write or upload (`.md`/`.txt`, up to 256 KB) the document that applies to *every* group of the entity,
-> or **Linked Groups → Manage** on a group row for that group's own document. You can also paste initial
-> context while creating the entity. Owners, admins and editors can edit; viewers read. Each scope has one
-> dashboard-managed document; documents added by `/push` or SQL appear in the same lists, read-only.
-> *Requires migration `20261022000000_dashboard_context_management.sql` (operator: `supabase db push`).*
+> to write or upload (`.md`/`.txt`, up to 256 KB) documents that apply to *every* group of the entity, or
+> **Linked Groups → Manage** on a group row for that group's own documents. You can also paste initial
+> context while creating the entity. Owners, admins and editors can edit; viewers read.
+> *Requires migrations `20261022000000_dashboard_context_management.sql` and
+> `20261027000000_context_doc_crud.sql` (operator: `supabase db push`).*
 >
-> The SQL below is the advanced/fallback path (bulk seeding, or when you want several named documents per
-> scope).
+> Each scope holds **as many named documents as you need**. The box above the list is always a *new*
+> document: saving it clears the box and the document appears in the list, and **Upload .md / .txt as a new
+> document** adds a file as its own document without touching whatever is in the box. Every document in the
+> list — including ones added by `/push` from a Telegram chat — can be edited, renamed or deleted from
+> there; the list keeps showing where each one came from, and editing a `/push` document does not change
+> that (pushing the same message again still overwrites it).
+>
+> The SQL below is the advanced/fallback path (bulk seeding).
 
 The bot answers from `doc_cache`. In v1 you push content **directly** into it (no GitHub sync). Run
 in the SQL editor as `postgres`.
@@ -970,7 +977,7 @@ select vault.update_secret(
 - **`prepare: false` in `lib/supabase.ts`** (A7) — ✅ confirmed set; required for the Supavisor transaction pooler.
 - **`scripts/sync-commands.ts` is updated** (A8c) — ✅ repointed to iterate active platform bots (`bots` table) and decrypt tokens via `get_current_bot_secret`. Bulk-syncs all active bots from the shared command list in `lib/commands.ts`.
 - **Phase 3.1 deferred cleanup** — once the platform bot is trusted in production: drop the now-unused `entities.telegram_bot_token_id` / `telegram_webhook_secret_id` / `telegram_bot_username` columns + modify `get_current_entity_secret` to drop their refs (keep `github_token_id`); delete the retired bots' Vault secrets; `/deletebot` the old bots in BotFather. Manual migration in `supabase/manual/`; snapshot the `entities` table first (a manual `pg_dump`/`select` suffices — data already mirrored into `bots`). See `docs/specs/SPEC-phase-3-bot-cutover.md` §9.
-- **Content management in the dashboard** (B2) — ✅ first version shipped: one dashboard-managed document per scope (entity-wide, per group) with optimistic-concurrency saves, `.md`/`.txt` upload, and read-only lists of every document (including `/push` and SQL-added ones) via `list_context_docs` / `get_managed_context` / `save_managed_context` (migration `20261022000000_dashboard_context_management.sql`; harness `scripts/test-dashboard-context.ts`). Not yet built: editing/deleting individual `/push`-added or per-topic documents, multiple named documents per scope, Markdown preview.
+- **Content management in the dashboard** (B2) — ✅ shipped: as many named documents per scope (entity-wide, per group) as needed, with optimistic-concurrency saves, `.md`/`.txt` upload as a document of its own, and edit / rename / delete for **every** document bound to the entity — ones added by `/push` from a chat and by SQL included — via `list_context_docs` / `create_context_doc` / `get_context_doc` / `update_context_doc` / `delete_context_doc` (migrations `20261022000000_dashboard_context_management.sql` and `20261027000000_context_doc_crud.sql`; harnesses `scripts/test-dashboard-context.ts` and `scripts/test-context-doc-crud.ts`). Creating a document at *topic* scope is still `/push`-only from the chat, though the dashboard can edit and delete the result. Not yet built: Markdown preview.
 - **`github_*` columns relaxed to nullable** (B1) — ✅ done (migration `20260624000000_relax_github_columns.sql`). The entity insert omits the nullable `github_*` columns in v1. (Future: a `sync_sources` refactor could move GitHub config out of `entities` when the content-store abstraction is formalized.) **Coordinated code change done:** the `Entity` TS interface in `lib/capabilities.ts` marks the `github_*` fields as `string | null`; the GitHub sync route has a config-completeness guard.
 - **`checkVaultSecretsHealth` is not exposed via any route** (A9) — wire it to a small admin/health endpoint for pre-launch verification (also a natural home for a privacy-mode check via `getMe`).
 - **`package.json` name is still `temp-next`** — rename to the project.

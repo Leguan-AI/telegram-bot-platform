@@ -30,12 +30,30 @@ export function decodeContextFile(bytes: ArrayBuffer | Uint8Array): string {
   return text;
 }
 
+/** The longest display_name normalize_context_doc_name accepts. */
+export const MAX_CONTEXT_NAME_LENGTH = 120;
+
+/** Turns an uploaded file name into a document name: drops the extension, keeps the rest. */
+export function documentNameFromFile(fileName: string): string {
+  const base = fileName.replace(/\.(md|markdown|txt)$/i, '').trim();
+  return base.slice(0, MAX_CONTEXT_NAME_LENGTH);
+}
+
 /** Maps a context RPC error message to something a person can act on. */
 export function contextErrorMessage(message: string | undefined | null): string {
   const m = message ?? '';
   if (m.includes('context_conflict')) {
     return 'Someone else saved a newer version while you were editing. Reload to see it (your unsaved text will be replaced).';
   }
+  if (m.includes('duplicate_doc_name')) {
+    return 'A document with that name already applies here. Pick a different name.';
+  }
+  if (m.includes('doc_not_found')) {
+    return 'That document no longer exists — someone else may have deleted it. Reload the page.';
+  }
+  if (m.includes('empty_name')) return 'Give the document a name.';
+  if (m.includes('name_too_long')) return `Document names are at most ${MAX_CONTEXT_NAME_LENGTH} characters.`;
+  if (m.includes('invalid_name')) return 'Document names must be a single line of text.';
   if (m.includes('empty_content')) return 'Context cannot be empty.';
   if (m.includes('content_too_large')) return `Context is too large (max ${MAX_CONTEXT_BYTES / 1024} KB).`;
   if (m.includes('group_not_in_entity')) return 'That group does not belong to this entity.';
