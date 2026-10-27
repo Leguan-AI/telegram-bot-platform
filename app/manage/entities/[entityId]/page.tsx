@@ -12,6 +12,7 @@ import {
 } from '@/lib/githubConnectUi';
 import '../../manage.css';
 import { ContextDocManager, type ContextDoc } from './ContextEditor';
+import { contextBudgetLevel, contextBudgetWarning, effectiveContextBytes, formatContextBytes } from '@/lib/contextBudget';
 import { RepoLinkSection, type RepoLinkRow, type RepoOption } from './RepoLinkEditor';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'Agent Platform';
@@ -257,11 +258,14 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
   const handleRefreshRepos = async () => {
     setGithubError('');
     setGithubSuccess('');
-    await loadRepoData();
-    setGithubSuccess('Repository list refreshed from GitHub.');
+    // loadRepoData reports its own failures through repoLoadError (shown in red), so only
+    // claim success when it actually loaded — never a green banner next to a red one.
+    if (await loadRepoData()) {
+      setGithubSuccess('Repository list refreshed from GitHub.');
+    }
   };
 
-  const loadRepoData = async () => {
+  const loadRepoData = async (): Promise<boolean> => {
     setRepoLoading(true);
     setRepoLoadError('');
     try {
@@ -274,7 +278,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) {
         setRepoLoadError('Your session expired. Reload the page and sign in again.');
-        return;
+        return false;
       }
 
       const res = await fetch(`/api/github/repositories?entity=${encodeURIComponent(entityId)}`, {
@@ -288,11 +292,13 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
             ? 'The GitHub App is not configured on the server yet, so the repository list is unavailable.'
             : 'Could not read the shared repositories from GitHub. Reload to try again.'
         );
-        return;
+        return false;
       }
       setRepoOptions((payload.repositories || []) as RepoOption[]);
+      return true;
     } catch (err: any) {
       setRepoLoadError(err.message || 'Could not load repository links.');
+      return false;
     } finally {
       setRepoLoading(false);
     }
@@ -867,6 +873,8 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                       <tbody>
                         {linkedGroups.map((g) => {
                           const docsForGroup = groupDocs(g.id);
+                          const groupBytes = effectiveContextBytes(entityDocs, docsForGroup);
+                          const groupLevel = contextBudgetLevel(groupBytes);
                           const expanded = expandedGroupId === g.id;
                           return (
                             <Fragment key={g.id}>
@@ -882,6 +890,18 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                                   >
                                     {docsForGroup.length} document{docsForGroup.length === 1 ? '' : 's'} · {expanded ? 'Close' : 'Manage'}
                                   </button>
+                                  {groupLevel !== 'ok' && (
+                                    <span
+                                      title={contextBudgetWarning(groupBytes) ?? undefined}
+                                      style={{
+                                        marginLeft: '0.5rem',
+                                        fontSize: '0.825rem',
+                                        color: groupLevel === 'over' ? 'var(--danger)' : '#fbbf24',
+                                      }}
+                                    >
+                                      {groupLevel === 'over' ? 'Over context budget' : 'Context near limit'} · {formatContextBytes(groupBytes)}
+                                    </span>
+                                  )}
                                 </td>
                               </tr>
                               {expanded && (
@@ -897,6 +917,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                                       groupId={g.id}
                                       canEdit={canEditContext}
                                       docs={docsForGroup}
+                                      inheritedDocs={entityDocs}
                                       onChanged={refreshContextDocs}
                                     />
                                   </td>
@@ -1152,7 +1173,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                     groupId={null}
                     heading="Every group in this directory"
                     description="For shared library repositories. Reachable from every group and topic here."
-                    onSaved={loadRepoData}
+                    onSaved={async () => { await loadRepoData(); }}
                   />
 
                   {linkedGroups.length === 0 ? (
@@ -1173,7 +1194,7 @@ export default function EntityDetails({ params }: { params: Promise<{ entityId: 
                         groupId={g.id}
                         heading={g.display_name || `Group ${g.telegram_chat_id}`}
                         description="Reachable from every topic in this group, unless a topic is pinned to fewer."
-                        onSaved={loadRepoData}
+                        onSaved={async () => { await loadRepoData(); }}
                       />
                     ))
                   )}

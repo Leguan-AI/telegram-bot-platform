@@ -11,6 +11,15 @@ import {
   contextErrorMessage,
   ContextFileError,
 } from '@/lib/contextFile';
+import {
+  CONTEXT_BUDGET_BYTES,
+  contextBudgetFraction,
+  contextBudgetLevel,
+  contextBudgetWarning,
+  effectiveContextBytes,
+  formatContextBytes,
+  type BudgetDoc,
+} from '@/lib/contextBudget';
 
 export interface ContextDoc {
   doc_id: string;
@@ -38,7 +47,7 @@ function appliesTo(doc: ContextDoc, showGroup: boolean): string {
   return showGroup ? `${topic} (${doc.group_name ?? 'unknown'})` : topic;
 }
 
-const formatKb = (bytes: number) => (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`);
+const formatKb = formatContextBytes;
 
 /**
  * A name no other document in the same scope is using. The database enforces this too
@@ -55,6 +64,56 @@ function uniqueName(base: string, taken: ContextDoc[], ignoreDocId?: string): st
     if (!used.has(candidate.toLowerCase())) return candidate;
   }
   return `${base} ${Date.now()}`;
+}
+
+interface ContextBudgetMeterProps {
+  /** Bytes the bot reads for an answer in this scope today. */
+  currentBytes: number;
+  /** Bytes if the draft in the editor were saved; null when there is no draft to project. */
+  projectedBytes: number | null;
+  /** What the total covers, e.g. "this entity's documents" — shown after "Total context". */
+  coverage: string;
+}
+
+/**
+ * Running total of the context the bot reads for one answer, against the advisory budget in
+ * lib/contextBudget.ts, with a warning as it approaches or passes it. Advisory only: nothing here
+ * (or on the server) refuses a save.
+ */
+export function ContextBudgetMeter({ currentBytes, projectedBytes, coverage }: ContextBudgetMeterProps) {
+  const shownBytes = projectedBytes ?? currentBytes;
+  const level = contextBudgetLevel(shownBytes);
+  const warning = contextBudgetWarning(shownBytes);
+  const colour = level === 'over' ? 'var(--danger)' : level === 'warn' ? '#fbbf24' : 'var(--primary, #2563eb)';
+  return (
+    <div style={{ marginBottom: '1rem' }} data-budget-level={level}>
+      <div className="context-meta" style={{ marginBottom: '0.35rem' }}>
+        <span>
+          <strong>Total context</strong> ({coverage}): {formatKb(currentBytes)} of {formatKb(CONTEXT_BUDGET_BYTES)} recommended
+        </span>
+        {projectedBytes !== null && projectedBytes !== currentBytes && (
+          <span>After saving this draft: {formatKb(projectedBytes)}</span>
+        )}
+      </div>
+      <div
+        role="progressbar"
+        aria-label="Context size against the recommended budget"
+        aria-valuemin={0}
+        aria-valuemax={CONTEXT_BUDGET_BYTES}
+        aria-valuenow={Math.min(shownBytes, CONTEXT_BUDGET_BYTES)}
+        style={{ height: 6, borderRadius: 3, background: 'rgba(148, 163, 184, 0.25)', overflow: 'hidden' }}
+      >
+        <div
+          style={{ width: `${contextBudgetFraction(shownBytes) * 100}%`, height: '100%', background: colour }}
+        />
+      </div>
+      {warning && (
+        <div className={`alert ${level === 'over' ? 'alert-error' : 'alert-warning'}`} style={{ marginTop: '0.5rem' }}>
+          {warning}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface ContextDocTableProps {
@@ -149,6 +208,11 @@ interface ContextDocManagerProps {
   /** Re-reads the document list after a create, edit or delete. */
   onChanged: () => void | Promise<void>;
   showGroup?: boolean;
+  /**
+   * Documents this scope inherits and the bot reads alongside its own: a group's answers also
+   * carry the entity-wide documents. Omit for the entity itself.
+   */
+  inheritedDocs?: ContextDoc[];
 }
 
 /**
@@ -167,6 +231,7 @@ export function ContextDocManager({
   docs,
   onChanged,
   showGroup = false,
+  inheritedDocs = [],
 }: ContextDocManagerProps) {
   // null = composing a new document; otherwise the doc_id being edited.
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -175,6 +240,9 @@ export function ContextDocManager({
   const [content, setContent] = useState('');
   // Exact string returned by the server; sent back untouched as the overwrite check
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  // What the editor held when it was loaded (empty for a new document), to tell a draft with
+  // unsaved changes from an untouched one.
+  const [baseline, setBaseline] = useState({ name: '', content: '' });
 
   const [saving, setSaving] = useState(false);
   const [busyDocId, setBusyDocId] = useState<string | null>(null);
@@ -192,12 +260,33 @@ export function ContextDocManager({
   const tooLarge = bytes > MAX_CONTEXT_BYTES;
   const canSave = canEdit && !saving && !tooLarge && content.trim() !== '' && name.trim() !== '';
 
+  const isDirty = name !== baseline.name || content !== baseline.content;
+
+  // The total the bot would read for an answer here, now and with the draft saved. An edit swaps
+  // the document's size for the draft's; a new document adds the draft to the scope.
+  const currentBytes = effectiveContextBytes(inheritedDocs, docs);
+  const hasDraft = content.trim() !== '';
+  let projectedBytes: number | null = null;
+  if (hasDraft) {
+    const draftSize = contextByteLength(content);
+    const draftDocs: BudgetDoc[] = editingId
+      ? docs.map((d) => (d.doc_id === editingId ? { ...d, size_bytes: draftSize } : d))
+      : [...docs, { doc_id: 'draft', scope: addScope, thread_name: null, size_bytes: draftSize }];
+    projectedBytes = effectiveContextBytes(inheritedDocs, draftDocs);
+  }
+
   const resetDraft = () => {
     setEditingId(null);
     setEditingSource(null);
     setName('');
     setContent('');
     setUpdatedAt(null);
+    setBaseline({ name: '', content: '' });
+  };
+
+  const handleCancel = () => {
+    if (isDirty && !confirm('Discard your unsaved changes to this document?')) return;
+    resetDraft();
   };
 
   const handleSave = async () => {
@@ -263,6 +352,16 @@ export function ContextDocManager({
   };
 
   const handleEdit = async (doc: ContextDoc) => {
+    // The editor holds one draft. Loading a document into it would throw away unsaved work
+    // without a word, so ask first (also covers re-clicking the document already open).
+    if (
+      isDirty &&
+      !confirm(
+        `You have unsaved changes in the editor. Discard them and open “${doc.display_name}”?`
+      )
+    ) {
+      return;
+    }
     setError('');
     setSuccess('');
     setBusyDocId(doc.doc_id);
@@ -276,8 +375,11 @@ export function ContextDocManager({
       if (!row) throw new Error('doc_not_found');
       setEditingId(doc.doc_id);
       setEditingSource(doc);
-      setName(row.display_name ?? doc.display_name);
-      setContent(row.content ?? '');
+      const loadedName = row.display_name ?? doc.display_name;
+      const loadedContent = row.content ?? '';
+      setName(loadedName);
+      setContent(loadedContent);
+      setBaseline({ name: loadedName, content: loadedContent });
       setUpdatedAt(row.updated_at ?? null);
       editorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     } catch (err: any) {
@@ -325,6 +427,16 @@ export function ContextDocManager({
     <div>
       {error && <div className="alert alert-error">{error}</div>}
       {success && <div className="alert alert-success">{success}</div>}
+
+      <ContextBudgetMeter
+        currentBytes={currentBytes}
+        projectedBytes={canEdit ? projectedBytes : null}
+        coverage={
+          groupId === null
+            ? 'all entity-wide documents, read in every group'
+            : 'entity-wide, this group’s and its largest topic’s documents'
+        }
+      />
 
       {canEdit && (
         <div ref={editorRef}>
@@ -386,7 +498,7 @@ export function ContextDocManager({
               {saving ? 'Saving...' : editingId ? 'Save changes' : 'Add document'}
             </button>
             {editingId && (
-              <button type="button" className="btn btn-secondary" onClick={resetDraft} disabled={saving}>
+              <button type="button" className="btn btn-secondary" onClick={handleCancel} disabled={saving}>
                 Cancel
               </button>
             )}
