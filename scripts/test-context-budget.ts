@@ -1,4 +1,5 @@
-// Unit tests for the context-size budget and the prompt doc-tag escaping. Pure; no database access.
+// Unit tests for the context-size budget, the per-document scope dedupe and the prompt doc-tag
+// escaping. Pure; no database access.
 // Run: npx tsx --test scripts/test-context-budget.ts
 import { test } from 'node:test';
 import assert from 'assert';
@@ -10,11 +11,11 @@ import {
   contextBudgetWarning,
   effectiveContextBytes,
   formatContextBytes,
-  sumDocBytes,
   type BudgetDoc,
 } from '../lib/contextBudget';
 import { MAX_CONTEXT_BYTES } from '../lib/contextFile';
 import { escapeDocAttr } from '../lib/contextDocTag';
+import { dedupeDocsByScope, docScopeOf, type DocScope } from '../lib/contextScope';
 
 const KB = 1024;
 const doc = (
@@ -61,11 +62,6 @@ test('formats bytes for display', () => {
   assert.strictEqual(formatContextBytes(1536), '1.5 KB');
 });
 
-test('sums sizes', () => {
-  assert.strictEqual(sumDocBytes([]), 0);
-  assert.strictEqual(sumDocBytes([{ size_bytes: 1 }, { size_bytes: 2 }]), 3);
-});
-
 test('entity total is the sum of its documents', () => {
   assert.strictEqual(effectiveContextBytes([], [doc('a', 'entity', 10), doc('b', 'entity', 20)]), 30 * KB);
   assert.strictEqual(effectiveContextBytes([], []), 0);
@@ -110,4 +106,111 @@ test('escapeDocAttr stops a name from breaking out of the attribute', () => {
 test('escapeDocAttr escapes & first so escapes are not double-escaped', () => {
   assert.strictEqual(escapeDocAttr('A & B'), 'A &amp; B');
   assert.strictEqual(escapeDocAttr('&quot;'), '&amp;quot;');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Scope dedupe. A manifest_entries row is a BINDING, not a document: the same document can be
+// bound entity-wide and to one group, and every query that joins the two tables returns it twice.
+// ---------------------------------------------------------------------------------------------
+
+/** A buildContext / getContextManifest row, as those queries select it. */
+const binding = (doc_id: string, group_id: string | null, thread_id: string | null) => ({
+  doc_id,
+  group_id,
+  thread_id,
+});
+
+test('docScopeOf reads the scope off the binding columns, topic winning over group', () => {
+  assert.strictEqual(docScopeOf(binding('d1', null, null)), 'entity');
+  assert.strictEqual(docScopeOf(binding('d1', 'g1', null)), 'group');
+  assert.strictEqual(docScopeOf(binding('d1', 'g1', 't1')), 'topic');
+  // A topic binding with no group recorded is still a topic, not an entity document.
+  assert.strictEqual(docScopeOf(binding('d1', null, 't1')), 'topic');
+});
+
+test('a document bound to one scope is left exactly as it was', () => {
+  const rows = [binding('a', null, null), binding('b', 'g1', null), binding('c', 'g1', 't1')];
+  assert.deepStrictEqual(dedupeDocsByScope(rows, docScopeOf), rows);
+  assert.deepStrictEqual(dedupeDocsByScope([], docScopeOf), []);
+});
+
+test('a document bound entity-wide AND to the group reaches the prompt once, as group', () => {
+  // buildContext order: entity layer first, then group. Both rows are the same document.
+  const rows = [
+    binding('shared', null, null), // entity binding
+    binding('other', null, null),
+    binding('shared', 'g1', null), // same document, bound to this group too
+  ];
+  const kept = dedupeDocsByScope(rows, docScopeOf);
+  assert.strictEqual(kept.length, 2, 'the duplicate binding is dropped');
+  assert.deepStrictEqual(
+    kept.map((r) => [r.doc_id, docScopeOf(r)]),
+    [['other', 'entity'], ['shared', 'group']],
+    'the most specific binding survives, so scope="group" is the truth about this answer'
+  );
+});
+
+test('the most specific binding wins however the rows arrive', () => {
+  const topicFirst = [binding('d', 'g1', 't1'), binding('d', null, null), binding('d', 'g1', null)];
+  assert.deepStrictEqual(
+    dedupeDocsByScope(topicFirst, docScopeOf).map((r) => docScopeOf(r)),
+    ['topic'],
+    'ordered by display name (getContextManifest), the topic binding still wins'
+  );
+  const alphabetical = [binding('d', null, null), binding('d', 'g1', 't1')];
+  assert.deepStrictEqual(dedupeDocsByScope(alphabetical, docScopeOf).map((r) => docScopeOf(r)), ['topic']);
+});
+
+test('kept rows stay in the order the query returned them', () => {
+  // The prompt-cache prefix depends on buildContext's order by (layer, created_at, doc_id), so the
+  // dedupe must not reshuffle what it keeps.
+  const rows = [binding('a', null, null), binding('b', null, null), binding('a', 'g1', null), binding('c', 'g1', null)];
+  assert.deepStrictEqual(
+    dedupeDocsByScope(rows, docScopeOf).map((r) => r.doc_id),
+    ['b', 'a', 'c'],
+    'a moves to its group position; b and c keep theirs'
+  );
+});
+
+test('two bindings at the same scope keep the first, so the result is deterministic', () => {
+  const rows = [
+    { doc_id: 'd', scope: 'group' as DocScope, tag: 'first' },
+    { doc_id: 'd', scope: 'group' as DocScope, tag: 'second' },
+  ];
+  assert.deepStrictEqual(
+    dedupeDocsByScope(rows, (r) => r.scope).map((r) => r.tag),
+    ['first']
+  );
+});
+
+test('the budget counts a document bound to two scopes once, as the bot reads it once', () => {
+  // The group's meter: entityDocs are inherited, and 'shared' is bound to the group as well, so
+  // list_context_docs returns it in both lists.
+  const inherited = [doc('shared', 'entity', 40), doc('e1', 'entity', 10)];
+  const groupScope = [doc('shared', 'group', 40), doc('g1', 'group', 5)];
+  assert.strictEqual(
+    effectiveContextBytes(inherited, groupScope),
+    55 * KB,
+    'shared is counted once (40), not twice (95)'
+  );
+});
+
+test('a document bound to a group and one of its topics counts in the topic, like the prompt', () => {
+  // buildContext labels it scope="topic", so it only loads when a question is asked in that topic.
+  const groupScope = [
+    doc('shared', 'group', 30),
+    doc('shared', 'topic', 30, 'Billing'),
+    doc('t2', 'topic', 10, 'Support'),
+  ];
+  assert.strictEqual(
+    effectiveContextBytes([], groupScope),
+    30 * KB,
+    'Billing (30) is the largest topic; nothing is left in the group layer'
+  );
+});
+
+test('deduping does not change a scope whose documents are each bound once', () => {
+  const inherited = [doc('e1', 'entity', 100)];
+  const groupScope = [doc('g1', 'group', 10), doc('t1', 'topic', 40, 'Billing')];
+  assert.strictEqual(effectiveContextBytes(inherited, groupScope), 150 * KB);
 });

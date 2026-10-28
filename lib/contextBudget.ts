@@ -8,6 +8,8 @@
 // fails, not just the one that added the last document. This is advisory UI only (PR #42, review
 // S1, option (a)); nothing server-side enforces it.
 
+import { dedupeDocsByScope, type DocScope } from './contextScope';
+
 /**
  * The most context we advise per answer: 400 KB, about 100K tokens at the usual ~4 bytes per token
  * for English text. That is roughly half of a 200K-token window, which leaves room for the
@@ -31,27 +33,30 @@ export type ContextBudgetLevel = 'ok' | 'warn' | 'over';
 /** The slice of a listed document the budget needs. */
 export interface BudgetDoc {
   doc_id: string;
-  scope: 'entity' | 'group' | 'topic';
+  scope: DocScope;
   thread_name: string | null;
   size_bytes: number;
-}
-
-export function sumDocBytes(docs: readonly { size_bytes: number }[]): number {
-  return docs.reduce((total, d) => total + d.size_bytes, 0);
 }
 
 /**
  * What one answer in this scope can carry, in bytes: the inherited documents (an entity's
  * documents for a group), plus the documents of the scope itself, plus — because a question is
  * asked in one topic at a time — the documents of the single largest topic, not of all topics.
+ * A document bound to two of those scopes counts once, as the bot reads it once.
  */
 export function effectiveContextBytes(
-  inherited: readonly { size_bytes: number }[],
+  inherited: readonly BudgetDoc[],
   docs: readonly BudgetDoc[]
 ): number {
+  // list_context_docs returns one row per manifest binding, so a document bound to more than one
+  // scope (entity-wide AND this group) is listed twice — once here as inherited and once as the
+  // scope's own. buildContext sends it to the model once, at its most specific scope, so count it
+  // once the same way, or the meter overstates what an answer actually carries.
+  const unique = dedupeDocsByScope([...inherited, ...docs], (d) => d.scope);
+
   const topicTotals = new Map<string, number>();
   let scopeTotal = 0;
-  for (const d of docs) {
+  for (const d of unique) {
     if (d.scope === 'topic') {
       const key = d.thread_name ?? '\0unnamed-topic';
       topicTotals.set(key, (topicTotals.get(key) ?? 0) + d.size_bytes);
@@ -60,7 +65,7 @@ export function effectiveContextBytes(
     }
   }
   const largestTopic = topicTotals.size > 0 ? Math.max(...topicTotals.values()) : 0;
-  return sumDocBytes(inherited) + scopeTotal + largestTopic;
+  return scopeTotal + largestTopic;
 }
 
 export function contextBudgetLevel(totalBytes: number): ContextBudgetLevel {

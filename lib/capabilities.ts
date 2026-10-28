@@ -26,6 +26,7 @@ import {
 import { RepoToolSession } from './repoTools';
 import type { ScopedRepoRef } from './repoToolsTypes';
 import { escapeDocAttr } from './contextDocTag';
+import { dedupeDocsByScope, docScopeOf } from './contextScope';
 import { runToolLoop } from './toolLoop';
 import { formatToolProgress } from './toolProgress';
 import { getModelIdentifier, getContextMessageHistoryLimit, ANTHROPIC_DOCUMENT_MODEL } from './config';
@@ -177,11 +178,12 @@ export async function buildContext(
 
   return await withTenantContext(entityId, async (tx) => {
     // 1. Fetch manifest entries and join with cached doc content (group-scoped)
-    // Lockstep Invariant (Row Selection only): Must match getContextManifest query WHERE/joins exactly.
+    // Lockstep Invariant (Row Selection only): Must match getContextManifest query WHERE/joins exactly,
+    // and dedupe the rows the same way — a row is a binding, not a document (see lib/contextScope.ts).
     // Ordering differs: getContextManifest sorts alphabetically for display, while buildContext sorts
     // by layer + created_at + doc_id so new documents append rather than insert, keeping the cache prefix stable.
-    const docs = await tx<{ thread_id: string | null; group_id: string | null; display_name: string; content: string; updated: string }[]>`
-      select m.thread_id, m.group_id, c.display_name, c.content,
+    const bindings = await tx<{ doc_id: string; thread_id: string | null; group_id: string | null; display_name: string; content: string; updated: string }[]>`
+      select m.doc_id, m.thread_id, m.group_id, c.display_name, c.content,
              to_char(c.synced_at at time zone 'utc', 'YYYY-MM-DD') as updated
       from manifest_entries m
       join doc_cache c on c.id = m.doc_id
@@ -199,10 +201,14 @@ export async function buildContext(
         m.doc_id
     `;
 
+    // A document bound to more than one scope in range (entity-wide AND this group, say) comes back
+    // once per binding; without this it would be concatenated into the prompt twice.
+    const docs = dedupeDocsByScope(bindings, docScopeOf);
+
     // Format docs as structured XML tags using path, scope, and updated attributes
     const contextDocs = docs
       .map((doc) => {
-        const scope = doc.thread_id !== null ? 'topic' : doc.group_id !== null ? 'group' : 'entity';
+        const scope = docScopeOf(doc);
         return `<document path="${escapeDocAttr(doc.display_name)}" scope="${scope}" updated="${doc.updated}">\n${doc.content}\n</document>`;
       })
       .join('\n\n');
@@ -1029,7 +1035,8 @@ export async function checkVaultSecretsHealth(
 
 /**
  * Resolves context document manifest for `/context` status and downloads.
- * Lockstep Invariant (Row Selection only): Must match buildContext query WHERE/joins exactly.
+ * Lockstep Invariant (Row Selection only): Must match buildContext query WHERE/joins exactly, and
+ * dedupe the rows the same way — a row is a binding, not a document (see lib/contextScope.ts).
  * Ordering differs: getContextManifest sorts alphabetically for display, while buildContext sorts
  * by layer + created_at + doc_id so new documents append rather than insert, keeping the cache prefix stable.
  */
@@ -1046,8 +1053,8 @@ export async function getContextManifest(
     threadId !== null && threadId !== undefined ? threadId.toString() : null;
 
   return await withTenantContext(entityId, async (tx) => {
-    const docs = await tx<{ thread_id: string | null; group_id: string | null; display_name: string; content: string }[]>`
-      select m.thread_id, m.group_id, c.display_name, c.content
+    const bindings = await tx<{ doc_id: string; thread_id: string | null; group_id: string | null; display_name: string; content: string }[]>`
+      select m.doc_id, m.thread_id, m.group_id, c.display_name, c.content
       from manifest_entries m
       join doc_cache c on c.id = m.doc_id
       left join threads t on t.id = m.thread_id
@@ -1056,6 +1063,10 @@ export async function getContextManifest(
         and (m.thread_id is null or t.telegram_thread_id = ${threadIdStr}::bigint)
       order by c.display_name
     `;
+
+    // One row per document, at its most specific scope, so a multi-bound document is listed in one
+    // layer only — the same layer buildContext puts it in.
+    const docs = dedupeDocsByScope(bindings, docScopeOf);
 
     const entityDocs = docs
       .filter((d) => d.group_id === null && d.thread_id === null)
