@@ -34,6 +34,27 @@ export const ALL_REPOS_SHARED_NOTE =
 /** Where an owner changes or removes what they shared. Lists every installation they own. */
 export const GITHUB_INSTALLATIONS_URL = 'https://github.com/settings/installations';
 
+/**
+ * The settings page for one installation, where the account's owner adds or removes the
+ * repositories shared with the App.
+ *
+ * Which repositories exist in the installation is GitHub's to decide, not ours: the App can read
+ * them but can never widen or narrow its own grant. So the dashboard cannot offer "add a
+ * repository" itself — it sends the owner to the page that can, and re-reads the list when they
+ * come back. A personal installation lives under the user's own settings; an organization's under
+ * the organization's.
+ */
+export function githubInstallationSettingsUrl(connection: {
+  installation_id: number;
+  account_login: string;
+  account_type: 'User' | 'Organization';
+}): string {
+  if (connection.account_type === 'Organization') {
+    return `https://github.com/organizations/${encodeURIComponent(connection.account_login)}/settings/installations/${connection.installation_id}`;
+  }
+  return `${GITHUB_INSTALLATIONS_URL}/${connection.installation_id}`;
+}
+
 /** Outcome of a callback, as carried in the status page's `result` parameter. */
 export type ConnectResultCode =
   // success

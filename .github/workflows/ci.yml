@@ -28,8 +28,10 @@ jobs:
         run: >
           npx tsx --test
           scripts/test-answer-budget.ts
+          scripts/test-context-budget.ts
           scripts/test-context-file.ts
           scripts/test-github-app-token.ts
+          scripts/test-github-connect-ui.ts
           scripts/test-github-owner-check.ts
           scripts/test-github-webhook.ts
           scripts/test-push-file.ts

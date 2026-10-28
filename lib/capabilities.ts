@@ -25,6 +25,7 @@ import {
 } from './repoAnswerTools';
 import { RepoToolSession } from './repoTools';
 import type { ScopedRepoRef } from './repoToolsTypes';
+import { escapeDocAttr } from './contextDocTag';
 import { runToolLoop } from './toolLoop';
 import { formatToolProgress } from './toolProgress';
 import { getModelIdentifier, getContextMessageHistoryLimit, ANTHROPIC_DOCUMENT_MODEL } from './config';
@@ -202,7 +203,7 @@ export async function buildContext(
     const contextDocs = docs
       .map((doc) => {
         const scope = doc.thread_id !== null ? 'topic' : doc.group_id !== null ? 'group' : 'entity';
-        return `<document path="${doc.display_name}" scope="${scope}" updated="${doc.updated}">\n${doc.content}\n</document>`;
+        return `<document path="${escapeDocAttr(doc.display_name)}" scope="${scope}" updated="${doc.updated}">\n${doc.content}\n</document>`;
       })
       .join('\n\n');
 

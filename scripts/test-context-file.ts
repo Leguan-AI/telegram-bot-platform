@@ -7,6 +7,8 @@ import {
   contextByteLength,
   decodeContextFile,
   contextErrorMessage,
+  documentNameFromFile,
+  MAX_CONTEXT_NAME_LENGTH,
   ContextFileError,
 } from '../lib/contextFile';
 
@@ -37,4 +39,22 @@ test('maps RPC errors to readable messages', () => {
   assert.match(contextErrorMessage('Access Denied'), /permission/);
   assert.strictEqual(contextErrorMessage('boom'), 'boom');
   assert.strictEqual(contextErrorMessage(null), 'Something went wrong.');
+});
+
+test('documentNameFromFile drops a known extension, keeps the rest, and caps the length', () => {
+  assert.strictEqual(documentNameFromFile('pricing.md'), 'pricing');
+  assert.strictEqual(documentNameFromFile('Notes.MARKDOWN'), 'Notes');
+  assert.strictEqual(documentNameFromFile('a.b.txt'), 'a.b');
+  assert.strictEqual(documentNameFromFile('  spaced  .txt'), 'spaced');
+  assert.strictEqual(documentNameFromFile('readme.pdf'), 'readme.pdf');
+  assert.strictEqual(documentNameFromFile('.md'), '');
+  assert.strictEqual(documentNameFromFile(`${'x'.repeat(200)}.md`).length, MAX_CONTEXT_NAME_LENGTH);
+});
+
+test('contextErrorMessage explains the document-name and lookup errors', () => {
+  assert.match(contextErrorMessage('duplicate_doc_name'), /already applies here/);
+  assert.match(contextErrorMessage('doc_not_found'), /no longer exists/);
+  assert.match(contextErrorMessage('empty_name'), /name/);
+  assert.match(contextErrorMessage('name_too_long'), new RegExp(`${MAX_CONTEXT_NAME_LENGTH} characters`));
+  assert.match(contextErrorMessage('invalid_name'), /single line/);
 });
