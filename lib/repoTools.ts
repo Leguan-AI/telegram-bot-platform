@@ -177,6 +177,14 @@ export class RepoToolSession {
     const tree = await this.loadTree(repo);
     if ('error' in tree) return this.remember(key, tree.error);
 
+    // A truncated tree is an arbitrary prefix of the repository, so the requested
+    // directory may be missing from it altogether. Filtering what we hold would then
+    // answer "no entries" for a directory full of files, which is worse than slow.
+    if (tree.value.truncated) {
+      const fallback = await this.listTruncatedDirectory(repo, root.path, depth);
+      return this.remember(key, fallback, fallback.isError ? 'notice' : 'content');
+    }
+
     const prefix = root.path ? `${root.path}/` : '';
     // Name-blocked entries go before anything counts them, so neither the listing nor the
     // "…N more" marker can reveal that they exist (§6 rule 6).
@@ -202,10 +210,6 @@ export class RepoToolSession {
     if (visible.length > shown.length) {
       lines.push(`…${visible.length - shown.length} more entries`);
     }
-    if (tree.value.truncated) {
-      lines.push('(GitHub truncated this repository’s tree, so the listing may be incomplete.)');
-    }
-
     const listing = lines.join('\n');
     this.bytesReturned += listing.length;
     return this.remember(key, { content: listing }, 'content');
@@ -425,6 +429,72 @@ export class RepoToolSession {
   }
 
   /** One recursive tree per repository per answer (§6). */
+  /**
+   * One directory, fetched directly, for a repository whose tree GitHub truncated (§6).
+   *
+   * GitHub truncates a recursive tree at roughly 100,000 entries or 7 MB. The contents
+   * API answers for one directory at the pinned commit, which is accurate where the held
+   * tree is not. It returns a single level, so a deeper request is answered with what one
+   * level shows and told so — the alternative is a request per subdirectory, with no
+   * bound on how many that is.
+   */
+  private async listTruncatedDirectory(
+    repo: RepoState,
+    path: string,
+    depth: number
+  ): Promise<ToolResult> {
+    const sha = await this.getSha(repo);
+    if ('error' in sha) return sha.error;
+
+    const encoded = path ? `/${path.split('/').map(encodeURIComponent).join('/')}` : '';
+    const response = await this.request(
+      `${GITHUB_API}/repos/${repo.ref.fullName}/contents${encoded}?ref=${sha.value}`,
+      'rest',
+      {},
+      [404]
+    );
+    if ('error' in response) return response.error;
+    if (response.value.status === 404) {
+      return { content: path ? `No entries under ${path}.` : 'This repository appears to be empty.' };
+    }
+
+    const data = await response.value.json();
+    // The contents API returns an object for a file and an array for a directory.
+    if (!Array.isArray(data)) {
+      return { content: `${path} is a file. Use read_file for its contents.` };
+    }
+
+    const prefix = path ? `${path}/` : '';
+    const entries: TreeEntry[] = [];
+    for (const raw of data) {
+      const entry = toListingEntry(raw);
+      if (entry) entries.push(entry);
+    }
+
+    // Blocked names go before anything counts them, exactly as in the complete-tree path
+    // (§6 rule 6): the fallback must not become a way to learn that a file exists.
+    const visible = filterListing(entries, (entry) => entry.path);
+    if (visible.length === 0) {
+      return { content: path ? `No entries under ${path}.` : 'This repository appears to be empty.' };
+    }
+
+    const shown = visible.slice(0, this.limits.maxTreeEntries);
+    const lines = shown.map((entry) => formatTreeEntry(entry, prefix));
+    if (visible.length > shown.length) {
+      lines.push(`…${visible.length - shown.length} more entries`);
+    }
+
+    lines.push(
+      `(This repository is too large for me to hold its whole tree, so I listed ${
+        path ? path : 'the repository root'
+      } directly${depth > 1 ? ', one level only' : ''}. Ask for a subdirectory to go deeper.)`
+    );
+
+    const listing = lines.join('\n');
+    this.bytesReturned += listing.length;
+    return { content: listing };
+  }
+
   private async loadTree(
     repo: RepoState
   ): Promise<{ value: { entries: TreeEntry[]; truncated: boolean } } | { error: ToolResult }> {
@@ -613,6 +683,30 @@ function memoryKey(...parts: string[]): string {
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+/**
+ * One contents-API entry as a tree entry, so the truncated-tree fallback prints through
+ * the same formatter as an ordinary listing. Anything with a type we do not know is
+ * dropped rather than guessed at.
+ */
+function toListingEntry(raw: unknown): TreeEntry | null {
+  const item = raw as { path?: unknown; type?: unknown; size?: unknown };
+  if (typeof item?.path !== 'string' || typeof item.type !== 'string') return null;
+
+  const size = typeof item.size === 'number' ? item.size : undefined;
+  switch (item.type) {
+    case 'dir':
+      return { path: item.path, type: 'tree', mode: '040000' };
+    case 'submodule':
+      return { path: item.path, type: 'commit', mode: '160000' };
+    case 'symlink':
+      return { path: item.path, type: 'blob', mode: '120000' };
+    case 'file':
+      return { path: item.path, type: 'blob', mode: '100644', size };
+    default:
+      return null;
+  }
 }
 
 function formatTreeEntry(entry: TreeEntry, prefix: string): string {
