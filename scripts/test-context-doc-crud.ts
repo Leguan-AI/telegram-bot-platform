@@ -6,12 +6,15 @@
 // Run it against a Supabase branch or staging database, NOT production: an interrupted run would leave
 // fake auth users and entities behind. In production, verify with the dashboard UI instead.
 //
-// Requires the migration 20261027000000_context_doc_crud.sql to already be applied by the operator
-// (this script never applies migrations or touches the migration ledger). All rows are keyed to the
-// fixture UUIDs below; cleanup never runs an unscoped delete.
+// Requires the migrations 20261027000000_context_doc_crud.sql and
+// 20261028000000_context_doc_update_fixes.sql to already be applied by the operator (this script
+// never applies migrations or touches the migration ledger). All rows are keyed to the fixture
+// UUIDs below; cleanup never runs an unscoped delete.
 
 import postgres from 'postgres';
 import assert from 'assert';
+
+import { dedupeDocsByScope, docScopeOf } from '../lib/contextScope';
 
 // Fixtures — a distinct prefix from test-dashboard-context.ts, so both may run against one database.
 const OWNER_U = 'a6000001-0000-0000-0000-000000000000';
@@ -29,6 +32,11 @@ const G2 = 'f6000002-0000-0000-0000-000000000000'; // belongs to E2
 const T1 = '76000001-0000-0000-0000-000000000000';
 const D_PUSH = 'd6000001-0000-0000-0000-000000000000';
 const D_OTHER = 'd6000002-0000-0000-0000-000000000000'; // lives in E2
+// Two documents in one scope whose names differ only in case — not reachable through the dashboard,
+// but reachable through /push from a chat or manual SQL, which is how these are made below.
+const D_DUP_A = 'd6000003-0000-0000-0000-000000000000';
+const D_DUP_B = 'd6000004-0000-0000-0000-000000000000';
+const D_MULTI = 'd6000005-0000-0000-0000-000000000000'; // bound entity-wide AND to G1
 
 interface DocRow {
   doc_id: string;
@@ -126,6 +134,19 @@ async function main() {
     if (fn[0].c !== 5) {
       throw new Error(
         'Migration 20261027000000_context_doc_crud.sql is not applied. ' +
+          'Run `supabase db push` (operator step) before this harness.'
+      );
+    }
+
+    // Tests 9 and 10 check behaviour that only 20261028000000 gives update_context_doc. Without it
+    // they would fail as if the fix were broken, so say what is actually missing.
+    const fixed = await sql<{ ok: boolean }[]>`
+      select pg_get_functiondef(p.oid) like '%pg_advisory_xact_lock%' as ok
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'update_context_doc'`;
+    if (!fixed[0]?.ok) {
+      throw new Error(
+        'Migration 20261028000000_context_doc_update_fixes.sql is not applied. ' +
           'Run `supabase db push` (operator step) before this harness.'
       );
     }
@@ -311,6 +332,103 @@ async function main() {
     });
     assert.strictEqual(otherTenant[0].c, 1, 'the other tenant sees only its own document');
     console.log('✅ Test 8 passed.');
+
+    // ---------------------------------------------------------------- 9. Editing content beside a duplicate name
+    console.log('Test 9: a content-only edit is not blocked by a name clash it is not making...');
+    // Only /push and manual SQL can put two folded-equal names in one scope (create_context_doc
+    // refuses the second), so make them the way they really arise.
+    for (const [id, name] of [[D_DUP_A, 'dup'], [D_DUP_B, 'Dup']]) {
+      await sql`insert into public.doc_cache (id, entity_id, display_name, content, source_type, source)
+                values (${id}, ${E1}, ${name}, 'original', 'push', '{"pushed_via":"telegram_push"}'::jsonb)`;
+      await sql`insert into public.manifest_entries (entity_id, group_id, thread_id, doc_id) values (${E1}, null, null, ${id})`;
+    }
+
+    const dupA = (await getDoc(sql, OWNER_U, E1, D_DUP_A))[0];
+    const dupB = (await getDoc(sql, OWNER_U, E1, D_DUP_B))[0];
+    // The defect: this refused with duplicate_doc_name, because the check ran on the unchanged name
+    // and found the sibling. Neither document could ever be corrected again.
+    const tsDupA = await updateDoc(sql, OWNER_U, E1, D_DUP_A, 'dup', 'corrected A', dupA.updated_at);
+    assert.ok(tsDupA, 'the content of the lower-case one can be edited');
+    assert.strictEqual((await getDoc(sql, OWNER_U, E1, D_DUP_A))[0].content, 'corrected A');
+    const tsDupB = await updateDoc(sql, ADMIN_U, E1, D_DUP_B, 'Dup', 'corrected B', dupB.updated_at);
+    assert.strictEqual((await getDoc(sql, OWNER_U, E1, D_DUP_B))[0].content, 'corrected B');
+    assert.strictEqual((await getDoc(sql, OWNER_U, E1, D_DUP_B))[0].display_name, 'Dup', 'the name is untouched');
+
+    // A rename is still checked: taking a name a sibling already folds to stays a duplicate, and so
+    // does a rename that only changes case onto the sibling's spelling.
+    await expectError(
+      updateDoc(sql, OWNER_U, E1, D_DUP_B, 'dup', 'x', tsDupB),
+      /duplicate_doc_name/,
+      "rename onto the sibling's folded name"
+    );
+    // dA was renamed to 'Group One handbook' at entity scope in test 5. ('Pricing and plans' would
+    // be free here: test 3's document of that name is in G1's scope, not the entity's.)
+    await expectError(
+      updateDoc(sql, OWNER_U, E1, D_DUP_B, 'group ONE handbook', 'x', tsDupB),
+      /duplicate_doc_name/,
+      'rename onto another entity document'
+    );
+    // Renaming out of the clash works, and then the clash is gone.
+    const tsDupB2 = await updateDoc(sql, OWNER_U, E1, D_DUP_B, 'Deduplicated', 'corrected B', tsDupB);
+    assert.strictEqual((await getDoc(sql, OWNER_U, E1, D_DUP_B))[0].display_name, 'Deduplicated');
+    console.log('✅ Test 9 passed.');
+
+    // ---------------------------------------------------------------- 10. Concurrent renames to one name
+    console.log('Test 10: concurrent renames to the same free name...');
+    const freeName = 'Merged handbook';
+    assert.strictEqual(
+      (await listDocs(sql, OWNER_U, E1)).filter((d) => d.display_name.toLowerCase() === freeName.toLowerCase()).length,
+      0,
+      'the target name is free before the race'
+    );
+    // Both documents are at entity scope, so both renames compete for the one name. Before the fix
+    // each held `for update` on its OWN row only, saw the name free, and wrote it.
+    const renamers = await Promise.allSettled([
+      updateDoc(sql, EDITOR_U, E1, D_DUP_A, freeName, 'corrected A', tsDupA),
+      updateDoc(sql, ADMIN_U, E1, D_DUP_B, freeName, 'corrected B', tsDupB2),
+    ]);
+    assert.strictEqual(renamers.filter((r) => r.status === 'fulfilled').length, 1, 'exactly one rename wins');
+    assert.strictEqual(
+      renamers.filter((r) => r.status === 'rejected' && /duplicate_doc_name/.test((r as any).reason.message)).length,
+      1,
+      'the loser gets duplicate_doc_name'
+    );
+    assert.strictEqual(
+      (await listDocs(sql, OWNER_U, E1)).filter((d) => d.display_name === freeName).length,
+      1,
+      'the name ended up on exactly one document'
+    );
+    console.log('✅ Test 10 passed.');
+
+    // ---------------------------------------------------------------- 11. One document, two bindings
+    console.log('Test 11: a document bound to two scopes reaches the bot once...');
+    await sql`insert into public.doc_cache (id, entity_id, display_name, content, source_type)
+              values (${D_MULTI}, ${E1}, 'Shared handbook', 'read me once', 'manual')`;
+    await sql`insert into public.manifest_entries (entity_id, group_id, thread_id, doc_id) values (${E1}, null, null, ${D_MULTI})`;
+    await sql`insert into public.manifest_entries (entity_id, group_id, thread_id, doc_id) values (${E1}, ${G1}, null, ${D_MULTI})`;
+
+    const multiBindings = await botSql.begin(async (tx) => {
+      await tx`select set_config('app.current_entity_id', ${E1}, true)`;
+      return tx<{ doc_id: string; group_id: string | null; thread_id: string | null }[]>`
+        select m.doc_id, m.group_id, m.thread_id
+        from manifest_entries m
+        join doc_cache c on c.id = m.doc_id
+        left join threads t on t.id = m.thread_id
+        where m.entity_id = ${E1}
+          and (m.group_id is null or m.group_id = ${G1}::uuid)
+          and (m.thread_id is null or t.telegram_thread_id = 6001::bigint)
+          and m.doc_id = ${D_MULTI}
+        order by case when m.group_id is null and m.thread_id is null then 0 when m.thread_id is null then 1 else 2 end,
+                 m.created_at, m.doc_id`;
+    });
+    // The query cannot help this: a row is a binding, so the document is selected twice.
+    assert.strictEqual(multiBindings.length, 2, 'the join returns one row per binding');
+    // What buildContext does with those rows (lib/contextScope.ts) — the unit tests in
+    // scripts/test-context-budget.ts cover the logic; this checks the shape the database hands it.
+    const deduped = dedupeDocsByScope(multiBindings, docScopeOf);
+    assert.strictEqual(deduped.length, 1, 'the bot reads the document once');
+    assert.strictEqual(docScopeOf(deduped[0]), 'group', 'at its most specific scope, so scope="group" is true');
+    console.log('✅ Test 11 passed.');
 
     console.log('\n🎉 ALL CONTEXT DOCUMENT CRUD TESTS PASSED 🎉');
   } finally {
