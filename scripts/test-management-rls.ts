@@ -431,8 +431,13 @@ async function main() {
     // 11b: Authenticated stranger User C is default-denied on bots, bot_entities, link_tokens
     const deniedTbls = ['bots', 'bot_entities', 'link_tokens'];
     for (const tbl of deniedTbls) {
+      // Denied either as zero rows (RLS, no policy) or, since 20261029000000_api_surface_lockdown.sql
+      // revoked the table grants, as a permission error (42501).
       const rows: any = await runAsUser(sql, STRANGER_C, 'user_c@test.com', async (tx) => {
         return await tx.unsafe(`select * from public.${tbl}`);
+      }).catch((err: any) => {
+        assert.strictEqual(err?.code, '42501', `Test 11b Failed: unexpected error on public.${tbl}: ${err?.message}`);
+        return [];
       });
       assert.strictEqual(rows.length, 0, `Test 11b Failed: Stranger User C queried public.${tbl}`);
     }
