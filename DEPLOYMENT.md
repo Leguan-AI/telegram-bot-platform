@@ -188,6 +188,7 @@ Current migrations that need a push beyond the init schema include:
 | **`20261022020000_repo_link_management.sql`** | **repository linking: `list_repo_links` for the dashboard, `set_repo_links` and `get_github_connection_for_admin` for the server routes, and two more scope invariants on the `repo_links` trigger (no group from another entity, no thread from another group). Required before the picker in the GitHub tab can save.** |
 | **`20261023000000_github_webhooks.sql`** | **GitHub webhooks: the `github_webhook_deliveries` dedupe table and `resolve_github_installation`, the bootstrap resolver that replaces the dormant `resolve_entity_id_by_repo`. Required before `/api/webhooks/github` can do anything but reject.** |
 | **`20261023100000_model_calls_repo_tools.sql`** | **four additive columns on `model_calls` (`repo_tool_calls`, `thinking_tokens`, `answer_id`, `hop_index`) and a partial index on `answer_id`. An answer that reads repositories is several model calls, and these are what tie its hops together for cost and usage. Additive only: without it the repository answer path still works, but every hop insert fails on the missing columns, so the ledger would lose those rows (`logModelCall` swallows its own errors by design — the answer is still delivered).** |
+| **`20261029000000_api_surface_lockdown.sql`** | **API-surface lockdown: pins `search_path` on the three oldest SECURITY DEFINER functions, revokes `EXECUTE` from `PUBLIC`/`anon` (and from `authenticated`/`bot_service` where nothing calls the function), trims `anon`/`authenticated` table grants to the RLS-backed tables, and revokes the default privileges that auto-granted both on every new object. Ends with a self-check that fails the migration if `anon` can still execute a repo function or reach a table. Verify afterwards with `scripts/test-api-surface-lockdown.ts` (read-only catalog audit). Operator-applied only; additive for the app (every in-repo caller keeps its grant), but an out-of-repo caller of `resolve_entity_id_by_slug` or `set_current_entity` would need its grant restored.** |
 
 > After pushing the GitHub App migration, verify the new tables carry both flags:
 > ```sql
@@ -196,6 +197,35 @@ Current migrations that need a push beyond the init schema include:
 >   and relname in ('github_installations','repo_links','github_connect_invites');
 > ```
 > All three rows must show `t` / `t`.
+
+### Database grants: future functions need an explicit grant
+
+Since `20261029000000_api_surface_lockdown.sql`, the global default privileges for functions created by `postgres` no longer grant `EXECUTE` to `PUBLIC` (and the `public`-schema defaults no longer grant to `anon`/`authenticated`). The revoke is global, so it covers every schema, not just `public`. **Every function a later migration creates is callable by nobody except its owner until that migration grants it explicitly**, for example:
+
+```sql
+grant execute on function public.new_rpc(uuid)     to authenticated;  -- dashboard RPC
+grant execute on function public.new_bot_fn(uuid)  to bot_service;    -- bot server-side
+```
+
+A dashboard RPC or a function that an RLS policy calls fails with `permission denied for function` until the grant exists; never grant to `anon` or `PUBLIC`. Related points:
+
+- **Per creating role.** Default privileges only cover objects created by `postgres`. Objects created by another role (`supabase_admin`, a tool credential) fall outside them, and the migration cannot change `supabase_admin`'s defaults. Install extensions into the `extensions` schema, and after any out-of-band change run the census below.
+- **RLS helpers.** The `authorizations` policies call `is_entity_owner`, which `bot_service` cannot execute. That works only because `bot_service` has no table privilege on `authorizations`; a future bot query on that table needs both a table grant and `grant execute on function public.is_entity_owner(uuid) to bot_service;`.
+- **`resolve_entity_id_by_slug(text)` and `set_current_entity(uuid)`** are executable by no role after the lockdown (no caller in this repo). If an outside caller turns up, restore access with a new migration: `grant execute on function public.resolve_entity_id_by_slug(text) to bot_service;` (and the same for `set_current_entity(uuid)`).
+- **After applying the migration (operator):** run `scripts/test-api-surface-lockdown.ts` against the target database; it is a read-only catalog audit and warns about default ACLs owned by other roles. Optionally also list every grant in `public` (table and column level) and confirm no `anon` row appears:
+
+```sql
+select table_name, grantee, privilege_type
+from information_schema.role_table_grants
+where table_schema = 'public'
+union all
+select table_name, grantee, 'COLUMN: ' || column_name
+from information_schema.role_column_grants
+where table_schema = 'public'
+order by 1, 2;
+```
+
+  A last-mile check against the real API (create a throwaway table on a Supabase preview branch, then request it as `anon` and as the server role) is not part of this repo's tests and was not run for the lockdown; do it on a branch, never on production data.
 
 ## A5d. Webhook delivery retention (operator step)
 
@@ -966,7 +996,7 @@ select vault.update_secret(
 
 **Content (v1):** lives directly in `doc_cache`, edited from the `/manage` dashboard (entity-wide and per-group documents) or pushed via `/push` / SQL (B2). No GitHub in the v1 path; the store is abstracted so sync-sources (GitHub/Drive/Notion/etc.) can populate the cache later — see `docs/VISION.md`.
 
-**The four `SECURITY DEFINER` RLS-bypass functions** (the only sanctioned bypass surfaces): `resolve_entity_id_by_slug`, `resolve_github_installation` (GitHub webhook bootstrap — replaced the dormant `resolve_entity_id_by_repo`, which was dropped), `get_current_entity_secret` (entity-scoped secret access — `github_token_id`, plus the now-unused telegram refs until Phase 3.1 drops them), and `get_current_bot_secret` (Phase 3 — scopes Vault access to the current bot's token/webhook secret). Plus two non-secret bootstrap resolvers granted to `bot_service`: `resolve_bot_id_by_slug` and `resolve_entity_id_by_chat`. See `SECURITY-PROPOSAL.md` and `docs/specs/SPEC-phase-3-bot-cutover.md`.
+**The four `SECURITY DEFINER` RLS-bypass functions** (the only sanctioned bypass surfaces; since `20261029000000_api_surface_lockdown.sql` only `bot_service` can execute the ones the bot calls, and `anon` can execute none): `resolve_entity_id_by_slug` (no caller in the repo; no API role can execute it after the lockdown), `resolve_github_installation` (GitHub webhook bootstrap — replaced the dormant `resolve_entity_id_by_repo`, which was dropped), `get_current_entity_secret` (entity-scoped secret access — `github_token_id`, plus the now-unused telegram refs until Phase 3.1 drops them), and `get_current_bot_secret` (Phase 3 — scopes Vault access to the current bot's token/webhook secret). Plus two non-secret bootstrap resolvers granted to `bot_service`: `resolve_bot_id_by_slug` and `resolve_entity_id_by_chat`. See `SECURITY-PROPOSAL.md` and `docs/specs/SPEC-phase-3-bot-cutover.md`.
 
 **Prerequisite ordering (the parts that bite if done out of order):** Vault verified → `bot_service` role created → migration run (grants included) → platform bot created (`bots` row) → app deployed (pooler `DATABASE_URL`) → domain live → platform webhook registered (A8c).
 

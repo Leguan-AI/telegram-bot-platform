@@ -136,8 +136,16 @@ async function main() {
     ]) {
       await expectError(fnCall(), /42501|Access Denied/, 'authz');
     }
-    const strangerDirect = await runAsUser(sql, STRANGER_U, async (tx) => tx`select count(*)::int as c from public.doc_cache`);
-    assert.strictEqual(strangerDirect[0].c, 0, 'direct table read sees zero rows (no RLS path)');
+    // Direct table access is closed: either zero rows (RLS, no policy) or, since
+    // 20261029000000_api_surface_lockdown.sql, a plain permission error (no table grant).
+    const strangerDirect = await runAsUser(sql, STRANGER_U, async (tx) => tx`select count(*)::int as c from public.doc_cache`).then(
+      (rows) => rows[0].c,
+      (err: any) => {
+        assert.strictEqual(err?.code, '42501', 'direct table read must be denied with 42501');
+        return 0;
+      },
+    );
+    assert.strictEqual(strangerDirect, 0, 'direct table read sees zero rows (no RLS path)');
     assert.strictEqual((await getCtx(sql, VIEWER_U, E1, null)).length, 0, 'viewer can read (empty)');
     console.log('✅ Test 1 passed.');
 
