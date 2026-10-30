@@ -139,6 +139,37 @@ async function main() {
     }
     console.log('✅ postgres default privileges in public no longer grant to anon/authenticated.');
 
+    // 5b. Guard for "future functions need an explicit grant": postgres' GLOBAL default (no schema)
+    // for functions must not grant EXECUTE to PUBLIC (an aclitem with an empty grantee prints as
+    // '=X/postgres'). If it does, every function a later migration creates is callable by anon.
+    const globalFn = await sql`
+      select d.defaclacl::text as acl from pg_default_acl d
+      where d.defaclrole = 'postgres'::regrole and d.defaclnamespace = 0 and d.defaclobjtype = 'f'`;
+    assert.ok(globalFn.length === 1, 'postgres must have a global default ACL for functions (PUBLIC execute revoked)');
+    assert.ok(!/(^\{|,)=X\//.test(globalFn[0].acl as string), `global default still grants EXECUTE to PUBLIC: ${globalFn[0].acl}`);
+    console.log('✅ Future postgres-created functions do not default to PUBLIC execute (explicit grants required).');
+
+    // 5c. Informational: default privileges are per creating role. Defaults owned by any OTHER role
+    // that still grant anon/authenticated apply to objects that role creates (the migration cannot
+    // change them). Warn, do not fail: Supabase's own supabase_admin entries are expected.
+    const otherDefaults = await sql`
+      select d.defaclrole::regrole::text as owner, d.defaclobjtype as kind,
+             d.defaclnamespace::regnamespace::text as ns, d.defaclacl::text as acl
+      from pg_default_acl d
+      where d.defaclrole <> 'postgres'::regrole and d.defaclacl::text ~ '(anon|authenticated)='`;
+    for (const d of otherDefaults) {
+      console.warn(`⚠️  default ACL owned by ${d.owner} (kind ${d.kind}, schema ${d.ns}) grants anon/authenticated: ${d.acl}`);
+    }
+
+    // 6. Watch item: bot_service must have no privilege on authorizations. That is why it does not
+    // need EXECUTE on is_entity_owner (called by the authorizations policies). If this fails, grant
+    // is_entity_owner to bot_service as well.
+    const botAuthz = await sql`
+      select has_any_column_privilege('bot_service', 'public.authorizations'::regclass, 'select, insert, update, references')
+          or has_table_privilege('bot_service', 'public.authorizations'::regclass, 'delete, truncate, trigger') as ok`;
+    assert.strictEqual(botAuthz[0].ok, false, 'bot_service must hold no privilege on authorizations (else it also needs EXECUTE on is_entity_owner)');
+    console.log('✅ bot_service has no privilege on authorizations (so it does not need is_entity_owner).');
+
     console.log('\n🎉 API SURFACE LOCKDOWN VERIFIED');
   } finally {
     await sql.end();

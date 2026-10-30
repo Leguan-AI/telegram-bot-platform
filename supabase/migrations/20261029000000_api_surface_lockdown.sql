@@ -13,13 +13,17 @@
 -- Result, in one line each:
 --   * anon:           no table privilege, no function EXECUTE in public.
 --   * authenticated:  EXECUTE only on the dashboard RPCs and the two helpers the RLS policies call;
---                     table privileges only for the paths app/manage uses directly
---                     (entities: select/insert/update, authorizations: select/delete).
+--                     table privileges (select/insert/update/delete, under RLS) only on the three
+--                     tables that have policies written for it: entities, authorizations, profiles.
+--                     (The browser itself only reads/writes entities and authorizations directly.)
 --   * bot_service:    keeps every explicit grant it has; additionally keeps EXECUTE on
 --                     get_current_entity_secret (lib/capabilities.ts) and on has_active_auth (called by
 --                     the RLS policies on entities, which bot_service reads).
 --   * new objects:    postgres-created functions, tables and sequences no longer auto-grant to
---                     PUBLIC/anon/authenticated.
+--                     PUBLIC/anon/authenticated. THIS MEANS EVERY FUTURE FUNCTION NEEDS AN EXPLICIT
+--                     GRANT: a new RPC created by a later migration is callable by nobody (not even
+--                     the dashboard) until that migration grants EXECUTE to the role that calls it.
+--                     See section 3 and DEPLOYMENT.md ("Database grants: future functions").
 --
 -- Idempotent: create or replace, revoke, grant and alter default privileges are all safe to re-run.
 -- No data is modified. Never edit this file once applied; add a new migration instead.
@@ -98,6 +102,16 @@ grant  execute on function public.list_entity_groups(uuid)            to authent
 --                        no privilege on authorizations.
 --     anon needs neither (it holds no table privilege). Both are SECURITY DEFINER and only ever
 --     answer about auth.uid().
+--
+--     WATCH ITEM: the authorizations policies call is_entity_owner for every role, and bot_service
+--     does NOT have EXECUTE on it. That is harmless today because bot_service has no table privilege
+--     on authorizations at all (revoked in 20260626000000_management_plane_foundation.sql, section 10),
+--     and Postgres checks the table privilege before any RLS policy is evaluated, so a bot query on
+--     that table already fails with "permission denied for table authorizations" (checked on the
+--     local replica before and after this migration; no bot code reads authorizations). If a future
+--     bot query ever needs authorizations, it needs BOTH a table grant to bot_service and
+--     `grant execute on function public.is_entity_owner(uuid) to bot_service;`, otherwise it fails
+--     with "permission denied for function is_entity_owner".
 revoke execute on function public.has_active_auth(uuid, text)         from public, anon, authenticated, bot_service;
 revoke execute on function public.is_entity_owner(uuid)               from public, anon, authenticated, bot_service;
 grant  execute on function public.has_active_auth(uuid, text)         to authenticated, bot_service;
@@ -109,10 +123,15 @@ grant  execute on function public.is_entity_owner(uuid)               to authent
 revoke execute on function public.get_current_entity_secret(uuid)     from public, anon, authenticated, bot_service;
 grant  execute on function public.get_current_entity_secret(uuid)     to bot_service;
 
--- (d) No caller in app/, lib/ or scripts/. Kept in the database for now; no API role can execute
---     them. (Re-grant to bot_service in a later migration if an out-of-repo caller turns up.)
---     resolve_entity_id_by_slug is a documented bootstrap resolver; set_current_entity is replaced
---     by set_config() in lib/supabase.ts.
+-- (d) CLOSED TO EVERY ROLE: resolve_entity_id_by_slug and set_current_entity. There is no caller in
+--     app/, lib/ or scripts/ (resolve_entity_id_by_slug is a documented bootstrap resolver nothing
+--     uses; set_current_entity is replaced by set_config() in lib/supabase.ts). They stay in the
+--     database, but after this migration no API role (anon, authenticated, bot_service) can execute
+--     them, and bot_service loses the access it had before. If a caller outside this repo turns up
+--     (it will fail with "permission denied for function ..."), restore access with a NEW migration:
+--       grant execute on function public.resolve_entity_id_by_slug(text) to bot_service;
+--       grant execute on function public.set_current_entity(uuid)        to bot_service;
+--     (and update NO_API_ROLE / KEPT in scripts/test-api-surface-lockdown.ts to match).
 revoke execute on function public.resolve_entity_id_by_slug(text)     from public, anon, authenticated, bot_service;
 revoke execute on function public.set_current_entity(uuid)            from public, anon, authenticated, bot_service;
 
@@ -146,6 +165,19 @@ revoke execute on function public.touch_github_installation()         from publi
 -- - Supabase's per-schema entry for postgres in public grants EXECUTE to anon and authenticated;
 --   the second statement removes them.
 -- A later migration that needs a function callable by a role must now grant it explicitly.
+--
+-- SCOPE (read before adding a function): the first statement is the GLOBAL default for the postgres
+-- role, so it applies to functions postgres creates in EVERY schema, not just public. From now on
+-- any function a later migration creates (as postgres) is executable by its owner and nobody else.
+-- Each such migration must end with an explicit grant, e.g.
+--   grant execute on function public.new_rpc(uuid) to authenticated;   -- browser RPC
+--   grant execute on function public.new_bot_fn(uuid) to bot_service;  -- bot server-side
+-- and, for a function that anon/authenticated must NOT reach, nothing at all.
+-- Default privileges are also per CREATING role: they only cover objects created by postgres.
+-- Anything created by another role (supabase_admin, a dashboard or tool credential) is outside them;
+-- scripts/test-api-surface-lockdown.ts prints a warning for every such default ACL. The self-check
+-- below (at apply time) and that script (any time) fail if anon can reach anything in public,
+-- whichever role created it.
 --
 -- Not covered: Supabase's own entries for supabase_admin in public (it creates the objects of
 -- extensions installed there, such as citext). postgres cannot alter another role's defaults;

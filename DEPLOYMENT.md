@@ -198,6 +198,35 @@ Current migrations that need a push beyond the init schema include:
 > ```
 > All three rows must show `t` / `t`.
 
+### Database grants: future functions need an explicit grant
+
+Since `20261029000000_api_surface_lockdown.sql`, the global default privileges for functions created by `postgres` no longer grant `EXECUTE` to `PUBLIC` (and the `public`-schema defaults no longer grant to `anon`/`authenticated`). The revoke is global, so it covers every schema, not just `public`. **Every function a later migration creates is callable by nobody except its owner until that migration grants it explicitly**, for example:
+
+```sql
+grant execute on function public.new_rpc(uuid)     to authenticated;  -- dashboard RPC
+grant execute on function public.new_bot_fn(uuid)  to bot_service;    -- bot server-side
+```
+
+A dashboard RPC or a function that an RLS policy calls fails with `permission denied for function` until the grant exists; never grant to `anon` or `PUBLIC`. Related points:
+
+- **Per creating role.** Default privileges only cover objects created by `postgres`. Objects created by another role (`supabase_admin`, a tool credential) fall outside them, and the migration cannot change `supabase_admin`'s defaults. Install extensions into the `extensions` schema, and after any out-of-band change run the census below.
+- **RLS helpers.** The `authorizations` policies call `is_entity_owner`, which `bot_service` cannot execute. That works only because `bot_service` has no table privilege on `authorizations`; a future bot query on that table needs both a table grant and `grant execute on function public.is_entity_owner(uuid) to bot_service;`.
+- **`resolve_entity_id_by_slug(text)` and `set_current_entity(uuid)`** are executable by no role after the lockdown (no caller in this repo). If an outside caller turns up, restore access with a new migration: `grant execute on function public.resolve_entity_id_by_slug(text) to bot_service;` (and the same for `set_current_entity(uuid)`).
+- **After applying the migration (operator):** run `scripts/test-api-surface-lockdown.ts` against the target database; it is a read-only catalog audit and warns about default ACLs owned by other roles. Optionally also list every grant in `public` (table and column level) and confirm no `anon` row appears:
+
+```sql
+select table_name, grantee, privilege_type
+from information_schema.role_table_grants
+where table_schema = 'public'
+union all
+select table_name, grantee, 'COLUMN: ' || column_name
+from information_schema.role_column_grants
+where table_schema = 'public'
+order by 1, 2;
+```
+
+  A last-mile check against the real API (create a throwaway table on a Supabase preview branch, then request it as `anon` and as the server role) is not part of this repo's tests and was not run for the lockdown; do it on a branch, never on production data.
+
 ## A5d. Webhook delivery retention (operator step)
 
 The GitHub webhook de-duplicates on `X-GitHub-Delivery` so a delivery redelivered by hand
