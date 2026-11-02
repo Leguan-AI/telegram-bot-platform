@@ -21,11 +21,12 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 ## Migrations: grants for new tables, views and functions
 
-Since 2026-10-30 Supabase no longer auto-grants new `public` tables, views or sequences to `anon`/`authenticated`/`service_role`, and `20261029000000_api_surface_lockdown.sql` already removed those defaults here (and the `PUBLIC`/`anon`/`authenticated` default `EXECUTE` on new functions). A missing grant fails with `42501` before RLS runs. Full guidance: `DEPLOYMENT.md`, "Database grants: new tables (and views) need explicit grants" and the subsection before it for functions.
+Since 2026-10-30 Supabase no longer auto-grants new `public` tables, views or sequences to `anon`/`authenticated`/`service_role`, and `20261029000000_api_surface_lockdown.sql` removes those defaults for `anon`/`authenticated` here once it is applied (it is operator-applied), along with the `PUBLIC`/`anon`/`authenticated` default `EXECUTE` on new functions. A missing grant fails with `42501` before RLS runs. Full guidance: `DEPLOYMENT.md`, "Database grants: new tables (and views) need explicit grants" and the subsection before it for functions.
 
 - Every migration that creates a table, view or function states its grants **in the same file**; never rely on defaults. Use `revoke`/`grant` per role, never `grant all`.
 - Decide the access path first. Bot only: no `anon`/`authenticated` grant (note `bot_service` is auto-granted full DML on new tables by the init defaults; revoke and re-grant narrower if it needs less). Dashboard: prefer a `SECURITY DEFINER` RPC with `grant execute ... to authenticated`; use a direct table grant to `authenticated` only together with `enable row level security` and policies, and only for the operations `/manage` issues.
-- Never grant to `anon` or `PUBLIC` (nothing in `/manage` is public); never grant `truncate`, `references`, `trigger`; nothing to `service_role` (the app does not use it).
+- Never grant to `anon` or `PUBLIC` (nothing in `/manage` is public); never grant `truncate`, `references`, `trigger` or (PG17+) `maintain`; this app never grants or uses `service_role`.
+- If the bot also touches a browser-facing table, add a `bot_service` policy keyed on `app.current_entity_id` (as `entities` has); `bot_service`'s default DML grant alone returns no rows once RLS is on.
 - A grant without a policy returns no rows, a policy without a grant is unreachable; the new migration needs both for a browser-facing table.
 - Update `scripts/test-api-surface-lockdown.ts` (the expected `authenticated` tables and the `KEPT` function list) when you add a browser-facing table or RPC, and run it against the target database.
 - Do not edit an applied migration. Applying migrations to a remote database is the operator's act (see the test-harness rules above).
