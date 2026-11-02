@@ -227,6 +227,30 @@ order by 1, 2;
 
   A last-mile check against the real API (create a throwaway table on a Supabase preview branch, then request it as `anon` and as the server role) is not part of this repo's tests and was not run for the lockdown; do it on a branch, never on production data.
 
+### Database grants: new tables (and views) need explicit grants
+
+Supabase stopped auto-granting new `public` tables, views and sequences to `anon`, `authenticated` and `service_role` for existing projects on **2026-10-30** ([announcement](https://github.com/orgs/supabase/discussions/45329)). A Data API request (the `/manage` dashboard's `supabase.from(...)`) on an object with no grant fails with `42501 permission denied` **before RLS is evaluated**. Once `20261029000000_api_surface_lockdown.sql` is applied (it is operator-applied and, until then, not in effect), this repo behaves that way for tables created by `postgres` on any project: section 3 of that migration revokes the default table and sequence privileges from `anon`/`authenticated`, so a table without a grant is unreachable from the browser key, which is the safe default. Its defaults change does not touch `service_role`; this app neither grants it anything nor uses it.
+
+Decide the access path first; most new tables need **no** API-role grant at all:
+
+| Who reaches the table | What the migration must do |
+|---|---|
+| Only the bot (direct Postgres as `bot_service`, not the Data API) | Nothing for `anon`/`authenticated`. Note that `bot_service` **is** auto-granted `select, insert, update, delete` on every new table by the init schema's default privileges (`alter default privileges in schema public grant ... to bot_service`). If it needs less, `revoke all ... from bot_service` and grant back only what the code uses, as `20261023000000_github_webhooks.sql` does. |
+| The `/manage` dashboard, through a `SECURITY DEFINER` RPC (the pattern used for context docs, repo links, GitHub connection) | No table grant. Create the function and `grant execute on function ... to authenticated;` (see the previous subsection). Preferred for anything the browser should not query freely. |
+| The `/manage` dashboard, directly with `supabase.from('<table>')` | Table grant **and** RLS: `grant select[, insert, update, delete] on public.<table> to authenticated;` (only the operations the browser issues), `alter table ... enable row level security`, and policies for `authenticated`. Never grant to `anon`: the dashboard is behind login and nothing in `/manage` is public. Never grant `truncate`, `references`, `trigger` or (PostgreSQL 17+) `maintain`. If the bot also reads or writes the table, `bot_service` needs its own policy, because with RLS on and only an `authenticated` policy it sees no rows even though it holds the default DML grants: add one `to bot_service` keyed on `nullif(current_setting('app.current_entity_id', true), '')::uuid`, as the init schema does for `entities`. |
+
+The grants go in the **same migration** that creates the table, followed by a check that they took effect. Example for a browser-readable table:
+
+```sql
+create table public.example (...);
+alter table public.example enable row level security;
+create policy example_select on public.example for select to authenticated
+  using (public.is_entity_owner(entity_id));
+grant select on public.example to authenticated;   -- without this: 42501 before the policy runs
+```
+
+A grant without a policy leaves an RLS-enabled table that returns no rows; a policy without a grant is unreachable (`42501`). Both are needed, and neither alone is a security boundary. After adding a table to the `authenticated` set, update the expected list in `scripts/test-api-surface-lockdown.ts` (it currently asserts exactly `authorizations`, `entities`, `profiles`) and run it against the target database. Note that script's self-check and #44's migration check `truncate`, `references` and `trigger` but not `maintain`; `revoke all` in section 4 of the lockdown covers it for existing tables, so review a new migration's grants for it by hand. Views follow the same rules (a view runs with its owner's rights unless created `with (security_invoker = true)`, so prefer that, or an RPC). Sequences need `usage`/`select` grants only for a role that inserts through a serial/identity column; a few tables here use `bigserial` ids (e.g. `message_log`), and `bot_service` gets sequence privileges from the init defaults, so a browser-facing table should use uuid ids or an RPC. No code in this app uses the `service_role` key, and this app never grants it anything.
+
 ## A5d. Webhook delivery retention (operator step)
 
 The GitHub webhook de-duplicates on `X-GitHub-Delivery` so a delivery redelivered by hand
